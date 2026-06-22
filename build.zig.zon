@@ -1,0 +1,26 @@
+.{
+    .name = .zigsand,
+    .version = "0.1.0",
+    .fingerprint = 0x50a3e8d9dbc8d205,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .vulkan_zig = .{
+            .url = "git+https://github.com/Snektron/vulkan-zig.git#b496a6a561ffbbeb530b0f9ed4e059f88c0723a5",
+            .hash = "vulkan-0.0.0-r7Ytx7N9AwD7IZt5_XNHtkJ4G9qY0pCH-cpcOsbL8wzD",
+        },
+        .vulkan_headers = .{
+            .url = "git+https://github.com/KhronosGroup/Vulkan-Headers.git#8864cdc896bbc2a9b6eb36b3218fc9ef57908d77",
+            .hash = "N-V-__8AAPnEbQK6L3hGtJefy0xZjeg7KOxIEj8_obZC2_lF",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "shaders",
+        "tools",
+        "specs",
+        "README.md",
+        "LICENSE",
+    },
+}
