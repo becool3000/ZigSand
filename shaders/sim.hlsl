@@ -18,6 +18,7 @@ static const uint CHUNK_SIZE = 16u;
 static const uint TRAIT_PHASE_MASK = 0x3u;
 static const uint TRAIT_MOBILITY_SHIFT = 2u;
 static const uint TRAIT_MOBILITY_MASK = 0x1cu;
+static const uint TRAIT_USES_MOTION = 1u << 5u;
 static const uint TRAIT_VALID = 1u << 8u;
 static const uint PHASE_LIQUID = 2u;
 static const uint MOBILITY_POWDER = 2u;
@@ -30,7 +31,9 @@ static const uint MOTION_STRENGTH_SHIFT = 3u;
 static const uint MOTION_MASK = 0x7fu;
 static const uint PROPOSAL_ACCEPTED_SHIFT = 3u;
 static const uint PROPOSAL_REJECTED_SHIFT = 10u;
+static const uint PROPOSAL_USES_MOTION = 1u << 17u;
 static const uint WATER_START_STRENGTH = 6u;
+static const uint SAND_START_STRENGTH = 4u;
 
 // Canonical cell storage is never globally swapped. Active chunks produce a
 // scratch result, commit it back in place, and only the two activity-list roles
@@ -132,6 +135,7 @@ int2 IntentTarget(int2 source, uint intent) {
 
 uint PhaseOf(MaterialSpec spec) { return spec.traits & TRAIT_PHASE_MASK; }
 uint MobilityOf(MaterialSpec spec) { return (spec.traits & TRAIT_MOBILITY_MASK) >> TRAIT_MOBILITY_SHIFT; }
+bool UsesMotion(MaterialSpec spec) { return (spec.traits & TRAIT_USES_MOTION) != 0u; }
 uint FrictionOf(MaterialSpec spec) { return (spec.traits >> TRAIT_FRICTION_SHIFT) & TRAIT_NIBBLE_MASK; }
 uint MotionDecayOf(MaterialSpec spec) { return (spec.traits >> TRAIT_MOTION_DECAY_SHIFT) & TRAIT_NIBBLE_MASK; }
 
@@ -157,6 +161,7 @@ uint PackProposal(uint direction, uint acceptedMotion, uint rejectedMotion) {
 uint ProposalDirection(uint proposal) { return proposal & MOTION_DIRECTION_MASK; }
 uint ProposalAcceptedMotion(uint proposal) { return (proposal >> PROPOSAL_ACCEPTED_SHIFT) & MOTION_MASK; }
 uint ProposalRejectedMotion(uint proposal) { return (proposal >> PROPOSAL_REJECTED_SHIFT) & MOTION_MASK; }
+bool ProposalUsesMotion(uint proposal) { return (proposal & PROPOSAL_USES_MOTION) != 0u; }
 
 uint OppositeSide(uint direction) { return direction == INTENT_LEFT ? INTENT_RIGHT : INTENT_LEFT; }
 bool HasHorizontalMotion(uint motion) {
@@ -277,6 +282,26 @@ uint ScenarioCell(int2 coord) {
             if ((coord.x == 15 || coord.x == 16) && coord.y == 17)
                 return MakeCell(MATERIAL_SAND, (uint2)coord);
         }
+        if (Push.testCase == 15u) {
+            // Open basin spanning chunk boundaries with a small falling Water
+            // sheet. ScenarioMotion seeds opposing lateral tendencies.
+            if (coord.y == 6 && coord.x >= 4 && coord.x <= 27)
+                return MakeCell(MATERIAL_STONE, (uint2)coord);
+            if ((coord.x == 4 || coord.x == 27) && coord.y >= 6 && coord.y <= 18)
+                return MakeCell(MATERIAL_STONE, (uint2)coord);
+            if (coord.x >= 13 && coord.x <= 18 && coord.y >= 21 && coord.y <= 24)
+                return MakeCell(MATERIAL_WATER, (uint2)coord);
+        }
+        if (Push.testCase == 16u) {
+            // Sand sheet falling across chunk boundaries onto a short shelf;
+            // repeated diagonal avalanches exercise brief powder tendency.
+            if (coord.y == 6 && coord.x >= 3 && coord.x <= 28)
+                return MakeCell(MATERIAL_STONE, (uint2)coord);
+            if (coord.y == 13 && coord.x >= 14 && coord.x <= 17)
+                return MakeCell(MATERIAL_STONE, (uint2)coord);
+            if (coord.x >= 13 && coord.x <= 18 && coord.y >= 18 && coord.y <= 22)
+                return MakeCell(MATERIAL_SAND, (uint2)coord);
+        }
         return MakeCell(MATERIAL_EMPTY, (uint2)coord);
     }
 
@@ -291,6 +316,15 @@ uint ScenarioCell(int2 coord) {
     return MakeCell(MATERIAL_EMPTY, (uint2)coord);
 }
 
+uint ScenarioMotion(int2 coord, uint cell) {
+    if (!MotionEnabled() || MaterialOf(cell) != MATERIAL_WATER) return 0u;
+    if (Push.testCase == 15u) {
+        uint direction = coord.x <= 15 ? INTENT_RIGHT : INTENT_LEFT;
+        return MakeMotion(direction, WATER_START_STRENGTH);
+    }
+    return 0u;
+}
+
 [numthreads(16, 16, 1)]
 void InitMain(uint3 dispatchId : SV_DispatchThreadID) {
     if (dispatchId.x >= Push.paddedWidth || dispatchId.y >= Push.paddedHeight) return;
@@ -299,7 +333,8 @@ void InitMain(uint3 dispatchId : SV_DispatchThreadID) {
     uint cell = ScenarioCell(coord);
     Cells[index] = cell;
     Scratch[index] = cell;
-    Intents[index] = INTENT_STAY;
+    Intents[index] = PackProposal(INTENT_STAY, 0u, 0u);
+    WriteMotion(index, ScenarioMotion(coord, cell));
 }
 
 [numthreads(256, 1, 1)]
@@ -330,6 +365,7 @@ void PaintMain(uint3 dispatchId : SV_DispatchThreadID) {
     int2 coord = int2((int)Push.brushX, (int)Push.brushY) + offset;
     if (!InBounds(coord) || coord.x == 0 || coord.y == 0 || coord.x == (int)Push.width - 1 || coord.y == (int)Push.height - 1) return;
     Cells[IndexOf(coord)] = MakeCell(Push.brushMaterial, (uint2)coord);
+    WriteMotion(IndexOf(coord), 0u);
     ActivateNowHalo(coord);
     ActivateNextHalo(coord);
 }
@@ -359,32 +395,79 @@ void IntentMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID, ui
     uint material = MaterialOf(IntentTileCell(coord, base));
     MaterialSpec spec = MaterialSpecs[material];
     uint intent = INTENT_STAY;
+    uint acceptedMotion = 0u;
+    uint rejectedMotion = 0u;
     // Intents are movement proposals. Powder behavior is selected entirely by
     // immutable traits; material identity is not part of Sand's movement rule.
     if (MobilityOf(spec) == MOBILITY_POWDER) {
+        uint currentMotion = UsesMotion(spec) ? ReadMotion(index) : 0u;
+        uint currentStrength = MotionStrengthOf(currentMotion);
+        uint decay = MotionDecayOf(spec);
+        uint rejectionDecay = min(15u, decay + FrictionOf(spec));
+        uint preferredSide = HasHorizontalMotion(currentMotion) ? HorizontalSideOf(currentMotion) :
+            ((Mix(index ^ Push.tick ^ Push.seed) & 1u) == 0u ? INTENT_LEFT : INTENT_RIGHT);
         uint below = MaterialOf(IntentTileCell(coord + int2(0, -1), base));
         if (PowderCanEnter(spec, below)) {
             intent = INTENT_DOWN;
+            if (HasHorizontalMotion(currentMotion)) {
+                uint strength = DecayStrength(currentStrength, decay);
+                acceptedMotion = MakeMotion(DownwardMotionForSide(preferredSide), strength);
+                rejectedMotion = MakeMotion(OppositeSide(preferredSide), DecayStrength(strength, rejectionDecay));
+            }
         } else {
             bool left = PowderCanEnter(spec, MaterialOf(IntentTileCell(coord + int2(-1, -1), base)));
             bool right = PowderCanEnter(spec, MaterialOf(IntentTileCell(coord + int2(1, -1), base)));
-            if (left && right) intent = (Mix(index ^ Push.tick ^ Push.seed) & 1u) == 0u ? INTENT_DOWN_LEFT : INTENT_DOWN_RIGHT;
+            if (left && right) intent = preferredSide == INTENT_LEFT ? INTENT_DOWN_LEFT : INTENT_DOWN_RIGHT;
             else if (left) intent = INTENT_DOWN_LEFT;
             else if (right) intent = INTENT_DOWN_RIGHT;
+
+            if (intent != INTENT_STAY) {
+                uint chosenSide = intent == INTENT_DOWN_LEFT ? INTENT_LEFT : INTENT_RIGHT;
+                bool continuing = HasHorizontalMotion(currentMotion) && chosenSide == HorizontalSideOf(currentMotion);
+                uint strength = continuing ? DecayStrength(currentStrength, decay) :
+                    (currentStrength > 0u ? DecayStrength(currentStrength, rejectionDecay) : SAND_START_STRENGTH);
+                acceptedMotion = MakeMotion(intent, strength);
+                rejectedMotion = MakeMotion(OppositeSide(chosenSide), DecayStrength(strength, rejectionDecay));
+            }
         }
     } else if (material == MATERIAL_WATER) {
+        uint currentMotion = UsesMotion(spec) ? ReadMotion(index) : 0u;
+        uint currentStrength = MotionStrengthOf(currentMotion);
+        uint decay = MotionDecayOf(spec);
+        uint rejectionDecay = min(15u, decay + FrictionOf(spec));
+        uint preferredSide = HasHorizontalMotion(currentMotion) ? HorizontalSideOf(currentMotion) : HashedWaterSide(index);
         uint below = MaterialOf(IntentTileCell(coord + int2(0, -1), base));
         if (WaterCanEnter(below)) {
             intent = INTENT_DOWN;
+            // Gravity maintains a small downward tendency; a lateral component
+            // survives the fall and becomes the preferred basin direction.
+            uint strength = max(WATER_START_STRENGTH, DecayStrength(currentStrength, decay));
+            acceptedMotion = MakeMotion(DownwardMotionForSide(preferredSide), strength);
+            rejectedMotion = MakeMotion(OppositeSide(preferredSide), DecayStrength(strength, rejectionDecay));
         } else {
             bool left = WaterCanEnter(MaterialOf(IntentTileCell(coord + int2(-1, 0), base)));
             bool right = WaterCanEnter(MaterialOf(IntentTileCell(coord + int2(1, 0), base)));
-            if (left && right) intent = (Mix(index ^ Push.tick ^ Push.seed ^ 0xa511e9b3u) & 1u) == 0u ? INTENT_LEFT : INTENT_RIGHT;
+            if (left && right) intent = preferredSide;
             else if (left) intent = INTENT_LEFT;
             else if (right) intent = INTENT_RIGHT;
+
+            if (intent != INTENT_STAY) {
+                bool continuing = HasHorizontalMotion(currentMotion) && intent == HorizontalSideOf(currentMotion);
+                uint strength = continuing ? DecayStrength(currentStrength, decay) :
+                    (currentStrength > 0u ? DecayStrength(currentStrength, rejectionDecay) : WATER_START_STRENGTH);
+                acceptedMotion = MakeMotion(intent, strength);
+                uint rejectionStrength = strength > 0u ? strength : (currentStrength > 0u ? currentStrength : WATER_START_STRENGTH);
+                rejectedMotion = MakeMotion(OppositeSide(intent), DecayStrength(rejectionStrength, rejectionDecay));
+            } else {
+                acceptedMotion = currentStrength > 0u ?
+                    MakeMotion(OppositeSide(preferredSide), DecayStrength(currentStrength, rejectionDecay)) : 0u;
+                rejectedMotion = acceptedMotion;
+            }
         }
     }
-    Intents[index] = intent;
+    uint proposal = PackProposal(intent, acceptedMotion, rejectedMotion);
+    if (UsesMotion(spec)) proposal |= PROPOSAL_USES_MOTION;
+    Intents[index] = proposal;
 }
 
 static const int RESOLVE_HALO = 3;
@@ -399,8 +482,8 @@ uint ResolveCell(int2 coord, int2 base) {
     return SampleCell(coord);
 }
 
-uint ResolveIntent(int2 coord, int2 base) {
-    if (!InBounds(coord)) return INTENT_STAY;
+uint ResolveProposal(int2 coord, int2 base) {
+    if (!InBounds(coord)) return PackProposal(INTENT_STAY, 0u, 0u);
     int2 tile = coord - (base - int2(RESOLVE_HALO, RESOLVE_HALO));
     if (tile.x >= 0 && tile.y >= 0 && tile.x < (int)RESOLVE_TILE && tile.y < (int)RESOLVE_TILE)
         return ResolveIntents[(uint)tile.y * RESOLVE_TILE + (uint)tile.x];
@@ -409,8 +492,9 @@ uint ResolveIntent(int2 coord, int2 base) {
 
 void ConsiderCandidate(int2 source, int2 destination, int2 base, inout uint bestSource, inout uint bestHash) {
     if (!InBounds(source)) return;
-    uint intent = ResolveIntent(source, base);
-    if (intent == INTENT_STAY || any(IntentTarget(source, intent) != destination)) return;
+    uint proposal = ResolveProposal(source, base);
+    uint direction = ProposalDirection(proposal);
+    if (direction == INTENT_STAY || any(IntentTarget(source, direction) != destination)) return;
     uint sourceIndex = IndexOf(source);
     uint key = Mix(sourceIndex ^ (Push.tick * 0x9e3779b9u) ^ Push.seed);
     if (bestSource == INVALID_INDEX || key < bestHash || (key == bestHash && sourceIndex < bestSource)) {
@@ -432,9 +516,10 @@ uint WinnerFor(int2 destination, int2 base) {
 
 bool SourceAccepted(int2 source, int2 base) {
     if (!InBounds(source)) return false;
-    uint intent = ResolveIntent(source, base);
-    if (intent == INTENT_STAY) return false;
-    return WinnerFor(IntentTarget(source, intent), base) == IndexOf(source);
+    uint proposal = ResolveProposal(source, base);
+    uint direction = ProposalDirection(proposal);
+    if (direction == INTENT_STAY) return false;
+    return WinnerFor(IntentTarget(source, direction), base) == IndexOf(source);
 }
 
 [numthreads(16, 16, 1)]
@@ -445,7 +530,7 @@ void ResolveMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID, u
         int2 tileCoord = int2((int)(i % RESOLVE_TILE), (int)(i / RESOLVE_TILE));
         int2 coord = base + tileCoord - int2(RESOLVE_HALO, RESOLVE_HALO);
         ResolveCells[i] = SampleCell(coord);
-        ResolveIntents[i] = InBounds(coord) ? Intents[IndexOf(coord)] : INTENT_STAY;
+        ResolveIntents[i] = InBounds(coord) ? Intents[IndexOf(coord)] : PackProposal(INTENT_STAY, 0u, 0u);
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -456,26 +541,46 @@ void ResolveMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID, u
     uint incoming = WinnerFor(coord, base);
     bool leaving = SourceAccepted(coord, base);
     uint output = current;
+    uint currentProposal = ResolveProposal(coord, base);
+    uint outputMotion = ProposalDirection(currentProposal) == INTENT_STAY ?
+        ProposalAcceptedMotion(currentProposal) : ProposalRejectedMotion(currentProposal);
+    bool writesMotion = ProposalUsesMotion(currentProposal);
 
     if (incoming != INVALID_INDEX) {
         int2 source = int2((int)(incoming % Push.paddedWidth), (int)(incoming / Push.paddedWidth));
+        uint sourceProposal = ResolveProposal(source, base);
         output = ResolveCell(source, base);
+        outputMotion = ProposalAcceptedMotion(sourceProposal);
+        writesMotion = writesMotion || ProposalUsesMotion(sourceProposal);
     } else if (leaving) {
-        int2 target = IntentTarget(coord, ResolveIntent(coord, base));
+        int2 target = IntentTarget(coord, ProposalDirection(currentProposal));
         uint targetCell = ResolveCell(target, base);
+        uint targetProposal = ResolveProposal(target, base);
+        bool targetLeaving = SourceAccepted(target, base);
         MaterialSpec sourceSpec = MaterialSpecs[MaterialOf(current)];
         MaterialSpec targetSpec = MaterialSpecs[MaterialOf(targetCell)];
         bool displacesStationaryLiquid = MobilityOf(sourceSpec) == MOBILITY_POWDER &&
             PhaseOf(targetSpec) == PHASE_LIQUID && sourceSpec.density > targetSpec.density &&
-            !SourceAccepted(target, base);
-        if (displacesStationaryLiquid)
+            !targetLeaving;
+        if (displacesStationaryLiquid) {
             output = targetCell;
-        else
+            outputMotion = ProposalDirection(targetProposal) == INTENT_STAY ?
+                ProposalAcceptedMotion(targetProposal) : ProposalRejectedMotion(targetProposal);
+            writesMotion = writesMotion || ProposalUsesMotion(targetProposal);
+        } else {
             output = MakeCell(MATERIAL_EMPTY, (uint2)coord);
+            outputMotion = 0u;
+        }
     }
 
     Scratch[index] = output;
-    if (ResolveIntent(coord, base) != INTENT_STAY || output != current) ActivateNextHalo(coord);
+    // IntentMain is the only pass that reads canonical Motion. Resolve can
+    // therefore fuse destination-owned Motion commit without a scratch grid.
+    // The proposal carries channel participation, avoiding material-table loads
+    // and full-grid stores for cells that never own Motion.
+    if (writesMotion) WriteMotion(index, outputMotion);
+    if (ProposalDirection(currentProposal) != INTENT_STAY || output != current || outputMotion != 0u)
+        ActivateNextHalo(coord);
 }
 
 [numthreads(16, 16, 1)]
@@ -496,7 +601,20 @@ void ValidateMain(uint3 dispatchId : SV_DispatchThreadID) {
             if (material == MATERIAL_SAND) result.sandCount++;
             else if (material == MATERIAL_WATER) result.waterCount++;
             else if (material == MATERIAL_STONE) result.stoneCount++;
-            result.stateHash = Mix(result.stateHash ^ cell ^ (x + y * Push.paddedWidth));
+            result.cellHash = Mix(result.cellHash ^ cell ^ (x + y * Push.paddedWidth));
+        }
+    }
+    // Canonical channel order is cells first, then Motion. Component hashes
+    // make a mismatch diagnosable while stateHash covers the layered state.
+    result.stateHash = result.cellHash;
+    if (MotionEnabled()) {
+        for (uint y = 0u; y < Push.height; ++y) {
+            for (uint x = 0u; x < Push.width; ++x) {
+                uint index = x + y * Push.paddedWidth;
+                uint motion = MotionChannel[index] & MOTION_MASK;
+                if (motion != 0u) result.motionHash = Mix(result.motionHash ^ motion ^ index);
+                result.stateHash = Mix(result.stateHash ^ motion ^ index ^ 0x6d2b79f5u);
+            }
         }
     }
     result.activeCount = NextMeta[0];
@@ -533,6 +651,8 @@ void ValidateMain(uint3 dispatchId : SV_DispatchThreadID) {
         uint paddedCell = Cells[Push.paddedWidth + Push.width];
         if (MaterialOf(paddedCell) != MATERIAL_STONE) result.failures |= 4096u;
     }
+    if (Push.testCase == 15u && (result.waterCount != 24u || result.motionHash == 0u)) result.failures |= 8192u;
+    if (Push.testCase == 16u && (result.sandCount != 30u || result.motionHash == 0u)) result.failures |= 32768u;
 
     uint chunkCount = Push.chunksX * Push.chunksY;
     if (result.activeCount > chunkCount) result.failures |= 65536u;

@@ -177,50 +177,12 @@ fn runGpuTests(allocator: std.mem.Allocator, options: cli.Options) !void {
         }
     }
 
-    // Reset and replay a collision-heavy, cross-chunk fixture 100 times. Only
-    // the compact validation record crosses back to the host; the grid remains
-    // canonical GPU state throughout the test.
-    const determinism_runs = 100;
-    const determinism_ticks = 24;
-    var deterministic_baseline: abi.TestResult = undefined;
-    var mismatch_reported = false;
-    for (0..determinism_runs) |run_index| {
-        try simulation.resetScenario(14);
-        for (0..determinism_ticks) |_| _ = try simulation.tick(null);
-        const result = try simulation.validate(14);
-        if (result.failures != 0) failures |= result.failures;
-        if (run_index == 0) {
-            deterministic_baseline = result;
-            continue;
-        }
-        if (result.state_hash != deterministic_baseline.state_hash or
-            result.sand_count != deterministic_baseline.sand_count or
-            result.water_count != deterministic_baseline.water_count or
-            result.stone_count != deterministic_baseline.stone_count or
-            result.active_count != deterministic_baseline.active_count)
-        {
-            failures |= 0x8000_0000;
-            if (!mismatch_reported) {
-                mismatch_reported = true;
-                std.log.err(
-                    "determinism mismatch on run {d}: hash 0x{x}/0x{x}, counts S {d}/{d} W {d}/{d} Stone {d}/{d}, active {d}/{d}",
-                    .{
-                        run_index + 1,
-                        deterministic_baseline.state_hash,
-                        result.state_hash,
-                        deterministic_baseline.sand_count,
-                        result.sand_count,
-                        deterministic_baseline.water_count,
-                        result.water_count,
-                        deterministic_baseline.stone_count,
-                        result.stone_count,
-                        deterministic_baseline.active_count,
-                        result.active_count,
-                    },
-                );
-            }
-        }
-    }
+    // Only compact validation records cross back to the host; both canonical
+    // GPU channels are reset and replayed independently for every run.
+    const water_determinism = try runDeterminismCheck(&simulation, "Water basin", 15, 32, 100);
+    failures |= water_determinism.failures;
+    const sand_determinism = try runDeterminismCheck(&simulation, "Sand avalanche", 16, 10, 100);
+    failures |= sand_determinism.failures;
 
     // Once a blank world sleeps, repeated canonical/scratch ticks must neither
     // wake chunks nor mutate state.
@@ -260,8 +222,95 @@ fn runGpuTests(allocator: std.mem.Allocator, options: cli.Options) !void {
     if (odd.failures != 0) std.log.err("padded-boundary check failed: mask=0x{x}", .{odd.failures});
     failures |= odd.failures;
 
+    // The optional path binds only a one-word dummy buffer and must preserve
+    // the original cell-only behavior without touching MotionChannel.
+    var no_motion_simulation = try gpu.Simulation.init(&context, .{
+        .width = 32,
+        .height = 32,
+        .seed = options.seed,
+        .enable_motion = false,
+    });
+    defer no_motion_simulation.deinit();
+    try no_motion_simulation.resetScenario(4);
+    _ = try no_motion_simulation.tick(null);
+    const no_motion = try no_motion_simulation.validate(4);
+    if (no_motion.failures != 0 or no_motion.motion_hash != 0 or no_motion.state_hash != no_motion.cell_hash) {
+        std.log.err(
+            "disabled MotionChannel check failed: mask=0x{x} state=0x{x} cells=0x{x} motion=0x{x}",
+            .{ no_motion.failures, no_motion.state_hash, no_motion.cell_hash, no_motion.motion_hash },
+        );
+        failures |= 16384;
+    }
+
     if (failures != 0) return error.GpuTestsFailed;
-    std.log.info("14 GPU checks passed; 100-run deterministic hash=0x{x}", .{deterministic_baseline.state_hash});
+    std.log.info(
+        "16 GPU checks passed; Water state=0x{x} motion=0x{x}; Sand state=0x{x} motion=0x{x}",
+        .{
+            water_determinism.baseline.state_hash,
+            water_determinism.baseline.motion_hash,
+            sand_determinism.baseline.state_hash,
+            sand_determinism.baseline.motion_hash,
+        },
+    );
+}
+
+const DeterminismCheck = struct {
+    baseline: abi.TestResult,
+    failures: u32,
+};
+
+fn runDeterminismCheck(simulation: *gpu.Simulation, label: []const u8, scenario: u32, ticks: usize, runs: usize) !DeterminismCheck {
+    var baseline: abi.TestResult = undefined;
+    var failures: u32 = 0;
+    var mismatch_reported = false;
+    for (0..runs) |run_index| {
+        try simulation.resetScenario(scenario);
+        for (0..ticks) |_| _ = try simulation.tick(null);
+        const result = try simulation.validate(scenario);
+        failures |= result.failures;
+        if (run_index == 0) {
+            baseline = result;
+            continue;
+        }
+        if (!sameDeterministicState(baseline, result)) {
+            failures |= 0x8000_0000;
+            if (!mismatch_reported) {
+                mismatch_reported = true;
+                std.log.err(
+                    "{s} determinism mismatch on run {d}: state 0x{x}/0x{x}, cells 0x{x}/0x{x}, motion 0x{x}/0x{x}, counts S {d}/{d} W {d}/{d} Stone {d}/{d}, active {d}/{d}",
+                    .{
+                        label,
+                        run_index + 1,
+                        baseline.state_hash,
+                        result.state_hash,
+                        baseline.cell_hash,
+                        result.cell_hash,
+                        baseline.motion_hash,
+                        result.motion_hash,
+                        baseline.sand_count,
+                        result.sand_count,
+                        baseline.water_count,
+                        result.water_count,
+                        baseline.stone_count,
+                        result.stone_count,
+                        baseline.active_count,
+                        result.active_count,
+                    },
+                );
+            }
+        }
+    }
+    return .{ .baseline = baseline, .failures = failures };
+}
+
+fn sameDeterministicState(a: abi.TestResult, b: abi.TestResult) bool {
+    return a.state_hash == b.state_hash and
+        a.cell_hash == b.cell_hash and
+        a.motion_hash == b.motion_hash and
+        a.sand_count == b.sand_count and
+        a.water_count == b.water_count and
+        a.stone_count == b.stone_count and
+        a.active_count == b.active_count;
 }
 
 fn runBenchmark(allocator: std.mem.Allocator, options: cli.Options) !void {

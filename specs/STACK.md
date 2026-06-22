@@ -99,17 +99,19 @@ Material IDs are stable:
 
 Changing IDs, buffer element widths, push-constant fields, or structure packing is an ABI change and requires matching Zig and HLSL edits plus ABI tests.
 
-Each valid material also has one immutable 32-byte `MaterialSpec`, indexed by its stable ID in a 256-entry GPU table. It stores packed phase/mobility/flags, integer density and resistance, milli-degree Celsius defaults and ignition threshold, heat capacity, and a future reaction-table range. Current temperature, pressure, charge, and other evolving values require separate canonical GPU channels.
+Each valid material also has one immutable 32-byte `MaterialSpec`, indexed by its stable ID in a 256-entry GPU table. It stores packed phase/mobility/flags, four-bit dynamics traits, integer density and resistance, milli-degree Celsius defaults and ignition threshold, heat capacity, and a future reaction-table range. The dynamics traits are friction, motion decay, pressure response, disturbance decay, and surface response; Water and Sand currently consume friction and motion decay. Current temperature, pressure, charge, and other evolving values require separate canonical GPU channels.
 
 ## 7. World memory contract
 
 - Logical dimensions default to 1920×1080.
 - Storage dimensions are independently rounded up to multiples of 16.
 - Coordinates outside the logical world are treated as Stone.
-- The three core grids are canonical cells, scratch cells, and movement intents.
+- The three core grids are canonical cells, scratch cells, and packed movement proposals.
 - Each grid uses four bytes per padded cell.
 - Core grid storage at 1920×1080 must remain below 32 MiB; the current layout is 23.906 MiB.
 - The canonical grid is never globally swapped or copied for presentation.
+- MotionChannel is optional canonical `u32` storage: three direction bits, four strength bits, and zeroed reserved bits.
+- Enabled MotionChannel storage adds 7.969 MiB at 1920×1080 and has no second motion scratch grid.
 - Rendering reads the canonical buffer directly.
 - CPU readback is restricted to compact statistics and test result records.
 
@@ -117,7 +119,7 @@ No application heap allocation may occur during a normal simulation tick or rend
 
 ## 8. Shader descriptor contract
 
-Simulation descriptor set 0 contains thirteen storage-buffer bindings:
+Simulation descriptor set 0 contains fourteen storage-buffer bindings:
 
 | Binding | Buffer |
 |---:|---|
@@ -134,6 +136,7 @@ Simulation descriptor set 0 contains thirteen storage-buffer bindings:
 | 10 | Next indirect dispatch arguments |
 | 11 | Compact GPU test result |
 | 12 | Read-only material specifications |
+| 13 | Optional canonical MotionChannel, or a one-word dummy binding when disabled |
 
 The renderer exposes only canonical cells at set 0, binding 0. Rendering must not bind scratch, intent, or activity buffers.
 
@@ -146,9 +149,9 @@ Chunks and compute workgroups are 16×16 cells. A fixed simulation tick executes
 1. Clear next activity flags, count, and X indirect argument.
 2. Apply an optional compact brush command to canonical cells.
 3. Activate the painted chunk and its one-chunk halo in current and next lists.
-4. Dispatch `IntentMain` indirectly over the compact current list.
+4. Dispatch `IntentMain` indirectly over the compact current list; proposals contain direction plus accepted/rejected Motion outcomes.
 5. Barrier compute writes before resolution reads.
-6. Dispatch `ResolveMain` indirectly over the same current list.
+6. Dispatch `ResolveMain` indirectly over the same current list and commit destination-owned Motion after all channel reads have completed.
 7. Barrier scratch and activity writes before commit.
 8. Dispatch `CommitMain` indirectly over current active chunks only.
 9. Copy the next active count into its four-byte asynchronous statistic slot.
@@ -161,7 +164,10 @@ The simulation rotates three preallocated command-buffer, fence, timestamp-query
 Supported intents are Stay, Down, DownLeft, DownRight, Left, and Right.
 
 - Powder mobility attempts Down first, then one valid diagonal; Sand is the first material using this trait-driven path.
+- Sand's short-lived Motion biases a valid diagonal after an avalanche begins. Accepted tendency decays quickly, while rejection or forced redirection is exhausted by high friction.
 - Water attempts Down first, then one valid horizontal side.
+- Water's nonzero Motion direction biases valid lateral choices; accepted motion decays by `motion_decay`, while rejection or redirection also applies `friction`.
+- Motion never permits an otherwise invalid cell move, and fully blocked motion decays to zero so chunks can sleep.
 - Stone and Empty emit Stay.
 - Movement is limited to one cell per tick.
 - Sand may target Water.
@@ -231,6 +237,7 @@ Host tests must cover:
 - Letterboxed coordinate mapping.
 - Shader manifest completeness and embedded SPIR-V discovery.
 - Material-spec size, offsets, trait encodings, stable IDs, duplicate rejection, and reaction ranges.
+- Packed Motion and movement-proposal ABI values.
 
 Headless GPU tests must read back only the compact result structure and must verify:
 
@@ -248,6 +255,10 @@ Headless GPU tests must read back only the compact result structure and must ver
 - Active lists contain no duplicate or out-of-range IDs.
 - Non-multiple-of-16 worlds retain solid padded boundaries.
 - A cross-chunk collision scenario produces identical hashes, counts, and active count across 100 independent reset/replay runs.
+- The determinism state hash processes canonical cells first and MotionChannel second, with separate component hashes retained in the compact result.
+- A falling-Water basin fixture retains material counts, exercises lateral Motion, and produces stable layered hashes over 100 resets.
+- A falling-Sand shelf fixture retains material counts, exercises diagonal Motion, and produces stable layered hashes over 100 resets.
+- Disabling MotionChannel preserves cell-only behavior with a one-word dummy buffer.
 
 ## 14. Performance acceptance
 

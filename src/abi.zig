@@ -50,7 +50,8 @@ pub const MovementProposal = packed struct(u32) {
     direction: MotionDirection = .none,
     accepted_motion: u7 = 0,
     rejected_motion: u7 = 0,
-    reserved: u15 = 0,
+    uses_motion: u1 = 0,
+    reserved: u14 = 0,
 
     pub fn bits(self: MovementProposal) u32 {
         return @bitCast(self);

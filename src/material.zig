@@ -22,6 +22,7 @@ pub const Mobility = enum(u32) {
 pub const trait_phase_mask: u32 = 0x3;
 pub const trait_mobility_shift: u5 = 2;
 pub const trait_mobility_mask: u32 = 0x7 << trait_mobility_shift;
+pub const trait_uses_motion: u32 = 1 << 5;
 pub const trait_valid: u32 = 1 << 8;
 pub const trait_conductive: u32 = 1 << 9;
 pub const trait_blocks_pressure: u32 = 1 << 10;
@@ -36,6 +37,7 @@ pub const trait_nibble_mask: u32 = 0xf;
 pub const TraitOptions = struct {
     phase: Phase,
     mobility: Mobility,
+    uses_motion: bool = false,
     conductive: bool = false,
     blocks_pressure: bool = false,
     compressible: bool = false,
@@ -80,6 +82,10 @@ pub const MaterialSpec = extern struct {
 
     pub fn isValid(self: MaterialSpec) bool {
         return (self.traits & trait_valid) != 0;
+    }
+
+    pub fn usesMotion(self: MaterialSpec) bool {
+        return (self.traits & trait_uses_motion) != 0;
     }
 
     pub fn friction(self: MaterialSpec) u4 {
@@ -133,12 +139,14 @@ pub const MaterialRegistry = struct {
         registry.add(@intFromEnum(abi.Material.sand), MaterialSpec.init(.{
             .phase = .solid,
             .mobility = .powder,
+            .uses_motion = true,
             .friction = 12,
-            .motion_decay = 15,
+            .motion_decay = 3,
         }, 1600, std.math.maxInt(u32), 20_000, 830, no_ignition_temperature)) catch unreachable;
         registry.add(@intFromEnum(abi.Material.water), MaterialSpec.init(.{
             .phase = .liquid,
             .mobility = .fluid,
+            .uses_motion = true,
             .conductive = true,
             .friction = 2,
             .motion_decay = 1,
@@ -226,6 +234,7 @@ fn encodeTraits(options: TraitOptions) u32 {
     var traits = trait_valid |
         (@intFromEnum(options.phase) & trait_phase_mask) |
         ((@intFromEnum(options.mobility) << trait_mobility_shift) & trait_mobility_mask);
+    if (options.uses_motion) traits |= trait_uses_motion;
     if (options.conductive) traits |= trait_conductive;
     if (options.blocks_pressure) traits |= trait_blocks_pressure;
     if (options.compressible) traits |= trait_compressible;
@@ -249,10 +258,12 @@ test "material GPU ABI and trait encoding are stable" {
     try std.testing.expectEqual(Phase.solid, sand.phase());
     try std.testing.expectEqual(Mobility.powder, sand.mobility());
     try std.testing.expectEqual(@as(u32, 1600), sand.density);
+    try std.testing.expect(sand.usesMotion());
     try std.testing.expectEqual(@as(u4, 12), sand.friction());
-    try std.testing.expectEqual(@as(u4, 15), sand.motionDecay());
+    try std.testing.expectEqual(@as(u4, 3), sand.motionDecay());
 
     const water = registry.get(@intFromEnum(abi.Material.water)).?;
+    try std.testing.expect(water.usesMotion());
     try std.testing.expectEqual(@as(u4, 2), water.friction());
     try std.testing.expectEqual(@as(u4, 1), water.motionDecay());
     try std.testing.expectEqual(@as(u4, 0), water.pressureResponse());

@@ -46,14 +46,14 @@ Runtime options are `--width`, `--height`, `--tps`, `--seed`, `--validation`, `-
 
 ## Architecture
 
-Each cell is one `u32`: material in bits 0–7, deterministic visual variant in bits 8–15, flags in bits 16–23, and reserved bits in 24–31. The canonical cell grid, scratch grid, and intent grid consume about 24 MiB at 1920×1080. Storage is padded to 16×16 chunks; out-of-world cells behave as Stone.
+Each cell is one `u32`: material in bits 0–7, deterministic visual variant in bits 8–15, flags in bits 16–23, and reserved bits in 24–31. The canonical cell grid, scratch grid, and proposal grid consume about 24 MiB at 1920×1080. The optional canonical MotionChannel adds about 8 MiB without requiring another motion scratch grid. Storage is padded to 16×16 chunks; out-of-world cells behave as Stone.
 
 One fixed simulation tick executes:
 
 1. Clear only next-list metadata.
 2. Apply a compact brush command and wake its chunk halo.
 3. Dispatch intent generation indirectly over the current compact active list.
-4. Resolve destinations by gathering bounded source candidates and choosing the lowest deterministic integer `(hash, source_index)` key.
+4. Resolve destinations by gathering bounded source candidates and choosing the lowest deterministic integer `(hash, source_index)` key; commit winning Motion after all channel reads finish.
 5. Commit scratch cells only for current active chunks.
 6. Swap active-list handles, never the world grids.
 
@@ -65,7 +65,16 @@ Materials are authored in Zig as validated, stable-ID `MaterialSpec` records and
 
 Systems remain specialized GPU kernels that consume those traits. Contested state follows `propose -> gather -> deterministic resolve -> commit`, and each canonical channel has exactly one commit owner. If multiple systems can change cell material, they must submit to the same material-transition resolver. Determinism hashes cover canonical channels in a fixed order as those channels are added.
 
-This migration is intentionally incremental. Sand movement and liquid displacement are selected from phase, mobility, and density today; Water movement, rendering palettes, and scenario fixtures still use explicit material IDs. The host registry's `get`, `add`, `list`, and validation interfaces are the future seam for inspection and authoring tools, but ZigSand does not include MCP, runtime hot reload, or general debug readbacks yet.
+This migration is intentionally incremental. Sand movement and liquid displacement are selected from phase, mobility, and density. Water and Sand now share the first layered channel while rendering palettes and scenario fixtures still use explicit material IDs. The host registry's `get`, `add`, `list`, and validation interfaces are the future seam for inspection and authoring tools, but ZigSand does not include MCP, runtime hot reload, or general debug readbacks yet.
+
+### Layered channels
+
+- **MotionChannel:** actual integer movement tendency. Water retains lateral flow, while Sand retains only a brief diagonal avalanche tendency. Motion influences proposals but never bypasses occupancy or collision resolution.
+- **Pressure channel (future):** trapped force or head pressure. It will remain separate from MotionChannel.
+- **Wave/disturbance channel (future):** short-lived surface energy, separate from pressure and particle motion.
+- **Friction:** an immutable material trait that increases rejected-motion damping and will later modify disturbance decay. `motion_decay`, `pressure_response`, `disturbance_decay`, and `surface_response` are packed integer traits. Water uses low friction and slow decay; Sand uses high friction and fast decay.
+
+Motion is one packed `u32` per cell with a three-bit direction and four-bit strength. Each movement proposal stores accepted and rejected Motion outcomes plus a participation bit, so destination-centric resolution commits the correct value without material-table lookups or race-prone scatter writes. Sand seeds strength four after a diagonal move, preserves it for at most a few accepted moves, and drops it immediately when high-friction rejection exhausts the tendency.
 
 The test command runs host ABI/CLI/layout/coordinate/manifest tests plus shader-side GPU tests. GPU readback is limited to a 32-byte result record and a 4-byte active-count statistic. Benchmark mode forces all chunks active, warms up for two wall-clock seconds, then measures for ten seconds by default.
 
