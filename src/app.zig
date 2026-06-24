@@ -55,6 +55,9 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.Options) !void {
     var single_step = false;
     var selected: abi.Material = .sand;
     var brush_radius: u32 = 8;
+    var camera_center_x: f32 = @as(f32, @floatFromInt(options.width)) * 0.5;
+    var camera_center_y: f32 = @as(f32, @floatFromInt(options.height)) * 0.5;
+    var camera_zoom: f32 = 1;
     const tick_seconds = 1.0 / @as(f64, @floatFromInt(options.tps));
     var previous = secondsNow();
     var accumulator: f64 = 0;
@@ -87,6 +90,8 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.Options) !void {
         const elapsed = @min(now - previous, 0.25);
         previous = now;
         if (!paused) accumulator += elapsed;
+        updateCameraFromInput(&window, options.width, options.height, @floatCast(elapsed), &camera_center_x, &camera_center_y, &camera_zoom);
+        renderer.setCamera(camera_center_x, camera_center_y, camera_zoom);
 
         if (uncapped and !paused) {
             // Saturate simulation for most of a 60 Hz frame while preserving a
@@ -95,7 +100,7 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.Options) !void {
             const turbo_deadline = secondsNow() + 0.002;
             var turbo_ticks: u32 = 0;
             while (secondsNow() < turbo_deadline and turbo_ticks < 1024) : (turbo_ticks += 1) {
-                const brush = mapBrush(&window, options.width, options.height, brush_radius, selected);
+                const brush = mapBrush(&window, options.width, options.height, brush_radius, selected, camera_center_x, camera_center_y, camera_zoom);
                 _ = try simulation.tick(brush);
                 ticks += 1;
             }
@@ -103,7 +108,7 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.Options) !void {
         } else {
             var catch_up: u32 = 0;
             while ((!paused and accumulator >= tick_seconds and catch_up < 4) or single_step) {
-                const brush = mapBrush(&window, options.width, options.height, brush_radius, selected);
+                const brush = mapBrush(&window, options.width, options.height, brush_radius, selected, camera_center_x, camera_center_y, camera_zoom);
                 _ = try simulation.tick(brush);
                 ticks += 1;
                 catch_up += 1;
@@ -128,7 +133,7 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.Options) !void {
             var title_storage: [256]u8 = undefined;
             const title = std.fmt.bufPrintZ(
                 &title_storage,
-                "ZigSand | {d} FPS | {d} TPS{s} | {d}/{d} chunks | GPU I {d:.2} R {d:.2} P {d:.2} D {d:.2} C {d:.2} Draw {d:.2} ms | view {s} | brush {d}{s}",
+                "ZigSand | {d} FPS | {d} TPS{s} | {d}/{d} chunks | GPU I {d:.2} R {d:.2} P {d:.2} D {d:.2} C {d:.2} Draw {d:.2} ms | view {s} | zoom {d:.1}x | brush {d}{s}",
                 .{
                     frames,
                     ticks,
@@ -142,6 +147,7 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.Options) !void {
                     simulation.last_timings.commit_ms,
                     renderer.last_render_ms,
                     renderer.viewName(),
+                    camera_zoom,
                     brush_radius,
                     if (paused) " | PAUSED" else "",
                 },
@@ -162,9 +168,36 @@ fn secondsNow() f64 {
     return @as(f64, @floatFromInt(counter.QuadPart)) / @as(f64, @floatFromInt(frequency.QuadPart));
 }
 
-fn mapBrush(window: *const win32.Window, width: u32, height: u32, radius: u32, selected: abi.Material) ?gpu.Brush {
+fn updateCameraFromInput(window: *const win32.Window, width: u32, height: u32, elapsed: f32, center_x: *f32, center_y: *f32, zoom: *f32) void {
+    const zoom_step = std.math.pow(f32, 2.0, elapsed * 2.0);
+    if (window.isDown(.e)) zoom.* *= zoom_step;
+    if (window.isDown(.q)) zoom.* /= zoom_step;
+    zoom.* = std.math.clamp(zoom.*, 1.0, 64.0);
+
+    const visible_w = @as(f32, @floatFromInt(width)) / zoom.*;
+    const visible_h = @as(f32, @floatFromInt(height)) / zoom.*;
+    const pan_x = visible_w * 1.2 * elapsed;
+    const pan_y = visible_h * 1.2 * elapsed;
+    if (window.isDown(.a)) center_x.* -= pan_x;
+    if (window.isDown(.d)) center_x.* += pan_x;
+    if (window.isDown(.s)) center_y.* -= pan_y;
+    if (window.isDown(.w)) center_y.* += pan_y;
+    clampCamera(width, height, center_x, center_y, zoom);
+}
+
+fn clampCamera(width: u32, height: u32, center_x: *f32, center_y: *f32, zoom: *f32) void {
+    zoom.* = std.math.clamp(zoom.*, 1.0, 64.0);
+    const world_w: f32 = @floatFromInt(width);
+    const world_h: f32 = @floatFromInt(height);
+    const half_w = world_w / (zoom.* * 2.0);
+    const half_h = world_h / (zoom.* * 2.0);
+    center_x.* = std.math.clamp(center_x.*, half_w, world_w - half_w);
+    center_y.* = std.math.clamp(center_y.*, half_h, world_h - half_h);
+}
+
+fn mapBrush(window: *const win32.Window, width: u32, height: u32, radius: u32, selected: abi.Material, camera_center_x: f32, camera_center_y: f32, zoom: f32) ?gpu.Brush {
     const material: abi.Material = if (window.right_down) .empty else if (window.left_down) selected else return null;
-    const cell = coordinates.windowToCell(window.mouse_x, window.mouse_y, window.client_width, window.client_height, width, height) orelse return null;
+    const cell = coordinates.windowToCell(window.mouse_x, window.mouse_y, window.client_width, window.client_height, width, height, camera_center_x, camera_center_y, zoom) orelse return null;
     return .{ .x = cell.x, .y = cell.y, .radius = radius, .material = material };
 }
 
@@ -193,6 +226,20 @@ fn runGpuTests(allocator: std.mem.Allocator, options: cli.Options) !void {
             std.log.err("GPU atmosphere case {d} failed: mask=0x{x}", .{ test_case, result.failures });
         }
     }
+    try simulation.resetScenario(24);
+    _ = try simulation.tick(null);
+    const sand_steam = try simulation.validate(24);
+    if (sand_steam.failures != 0) {
+        failures |= sand_steam.failures;
+        std.log.err("GPU Sand/Steam swap case failed: mask=0x{x}", .{sand_steam.failures});
+    }
+    try simulation.resetScenario(25);
+    for (0..4) |_| _ = try simulation.tick(null);
+    const steam_escape = try simulation.validate(25);
+    if (steam_escape.failures != 0) {
+        failures |= steam_escape.failures;
+        std.log.err("GPU Steam-under-Sand escape case failed: mask=0x{x}", .{steam_escape.failures});
+    }
 
     // Only compact validation records cross back to the host; canonical GPU
     // layers are reset and replayed independently for every run.
@@ -206,6 +253,8 @@ fn runGpuTests(allocator: std.mem.Allocator, options: cli.Options) !void {
     failures |= pressure_determinism.failures;
     const atmosphere_determinism = try runDeterminismCheck(&simulation, "Atmospheric cycle", 23, 32, 100);
     failures |= atmosphere_determinism.failures;
+    failures |= try runMassConservationCheck(&simulation, "Demo atmosphere long cycle", 0, 8192, 75);
+    failures |= try runMassConservationCheck(&simulation, "Atmospheric long cycle", 23, 8192, 13);
 
     // Once a blank world sleeps, repeated canonical/scratch ticks must neither
     // wake chunks nor mutate state.
@@ -299,7 +348,7 @@ fn runGpuTests(allocator: std.mem.Allocator, options: cli.Options) !void {
 
     if (failures != 0) return error.GpuTestsFailed;
     std.log.info(
-        "24 GPU checks passed; Water state=0x{x} motion=0x{x}; Sand state=0x{x} motion=0x{x}; Disturbance state=0x{x} layer=0x{x}; Pressure state=0x{x} layer=0x{x}; Atmosphere state=0x{x} W/S/C={d}/{d}/{d}",
+        "28 GPU checks passed; Water state=0x{x} motion=0x{x}; Sand state=0x{x} motion=0x{x}; Disturbance state=0x{x} layer=0x{x}; Pressure state=0x{x} layer=0x{x}; Atmosphere state=0x{x} W/S/C={d}/{d}/{d}",
         .{
             water_determinism.baseline.state_hash,
             water_determinism.baseline.motion_hash,
@@ -376,6 +425,87 @@ fn runDeterminismCheck(simulation: *gpu.Simulation, label: []const u8, scenario:
         }
     }
     return .{ .baseline = baseline, .failures = failures };
+}
+
+fn runMassConservationCheck(simulation: *gpu.Simulation, label: []const u8, scenario: u32, ticks: usize, expected_h2o: u32) !u32 {
+    try simulation.resetScenario(scenario);
+    for (0..ticks) |_| _ = try simulation.tick(null);
+    const result = try simulation.validate(scenario);
+    const total_h2o = result.water_count + result.steam_count + result.cloud_count;
+    if (result.failures != 0 or total_h2o != expected_h2o) {
+        const drift = try findMassDrift(simulation, scenario, ticks, expected_h2o);
+        std.log.err(
+            "{s} mass check failed after {d} ticks: mask=0x{x} H2O={d}/{d} W/S/C={d}/{d}/{d}; first drift tick {d} H2O={d} W/S/C={d}/{d}/{d}, prior H2O={d} W/S/C={d}/{d}/{d}",
+            .{
+                label,
+                ticks,
+                result.failures,
+                total_h2o,
+                expected_h2o,
+                result.water_count,
+                result.steam_count,
+                result.cloud_count,
+                drift.tick,
+                drift.total_h2o,
+                drift.water_count,
+                drift.steam_count,
+                drift.cloud_count,
+                drift.prior_total_h2o,
+                drift.prior_water_count,
+                drift.prior_steam_count,
+                drift.prior_cloud_count,
+            },
+        );
+        return result.failures | 33554432;
+    }
+    return 0;
+}
+
+const MassDrift = struct {
+    tick: usize,
+    total_h2o: u32,
+    water_count: u32,
+    steam_count: u32,
+    cloud_count: u32,
+    prior_total_h2o: u32,
+    prior_water_count: u32,
+    prior_steam_count: u32,
+    prior_cloud_count: u32,
+};
+
+fn findMassDrift(simulation: *gpu.Simulation, scenario: u32, ticks: usize, expected_h2o: u32) !MassDrift {
+    try simulation.resetScenario(scenario);
+    var prior = try simulation.validate(scenario);
+    for (0..ticks) |tick_index| {
+        _ = try simulation.tick(null);
+        const result = try simulation.validate(scenario);
+        const total_h2o = result.water_count + result.steam_count + result.cloud_count;
+        if (total_h2o != expected_h2o) {
+            return .{
+                .tick = tick_index + 1,
+                .total_h2o = total_h2o,
+                .water_count = result.water_count,
+                .steam_count = result.steam_count,
+                .cloud_count = result.cloud_count,
+                .prior_total_h2o = prior.water_count + prior.steam_count + prior.cloud_count,
+                .prior_water_count = prior.water_count,
+                .prior_steam_count = prior.steam_count,
+                .prior_cloud_count = prior.cloud_count,
+            };
+        }
+        prior = result;
+    }
+    return .{
+        .tick = ticks,
+        .total_h2o = expected_h2o,
+        .water_count = 0,
+        .steam_count = 0,
+        .cloud_count = 0,
+        .prior_total_h2o = expected_h2o,
+        .prior_water_count = 0,
+        .prior_steam_count = 0,
+        .prior_cloud_count = 0,
+    };
 }
 
 fn sameDeterministicState(a: abi.TestResult, b: abi.TestResult) bool {

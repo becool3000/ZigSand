@@ -19,6 +19,9 @@ pub const Renderer = struct {
     channel_flags: u32,
     prefer_immediate: bool,
     view_mode: abi.RenderView = .cells,
+    camera_center_x: f32 = 0,
+    camera_center_y: f32 = 0,
+    zoom: f32 = 1,
 
     descriptor_layout: vk.DescriptorSetLayout,
     descriptor_pool: vk.DescriptorPool,
@@ -67,6 +70,9 @@ pub const Renderer = struct {
         self.cells = cells;
         self.channel_flags = channel_flags;
         self.prefer_immediate = prefer_immediate;
+        self.camera_center_x = @as(f32, @floatFromInt(world_width)) * 0.5;
+        self.camera_center_y = @as(f32, @floatFromInt(world_height)) * 0.5;
+        self.zoom = 1;
 
         var bindings: [4]vk.DescriptorSetLayoutBinding = undefined;
         for (&bindings, 0..) |*binding, index| binding.* = .{
@@ -304,6 +310,12 @@ pub const Renderer = struct {
         return @tagName(self.view_mode);
     }
 
+    pub fn setCamera(self: *Renderer, center_x: f32, center_y: f32, zoom: f32) void {
+        self.camera_center_x = center_x;
+        self.camera_center_y = center_y;
+        self.zoom = zoom;
+    }
+
     /// Acquisition is deliberately non-blocking: while the compositor owns all
     /// swapchain images, the application can spend that time simulating.
     pub fn draw(self: *Renderer) !DrawResult {
@@ -399,6 +411,9 @@ pub const Renderer = struct {
             .seed = self.seed,
             .view_mode = @intFromEnum(self.view_mode),
             .channel_flags = self.channel_flags,
+            .camera_center_x = self.camera_center_x,
+            .camera_center_y = self.camera_center_y,
+            .zoom = self.zoom,
         };
         self.ctx.device.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .fragment_bit = true }, 0, @sizeOf(abi.RenderPush), &push);
         self.ctx.device.cmdDraw(self.command_buffer, 3, 1, 0, 0);

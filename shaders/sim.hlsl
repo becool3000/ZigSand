@@ -247,8 +247,9 @@ uint HashedWaterSide(uint index) {
 bool PowderCanEnter(MaterialSpec source, uint destinationMaterial) {
     if (destinationMaterial == MATERIAL_EMPTY) return true;
     MaterialSpec destination = MaterialSpecs[destinationMaterial];
-    return (destination.traits & TRAIT_VALID) != 0u &&
-        PhaseOf(destination) == PHASE_LIQUID && source.density > destination.density;
+    uint destinationPhase = PhaseOf(destination);
+    return (destination.traits & TRAIT_VALID) != 0u && source.density > destination.density &&
+        (destinationPhase == PHASE_LIQUID || destinationPhase == PHASE_GAS);
 }
 
 bool WaterCanEnter(MaterialSpec source, uint material) {
@@ -263,6 +264,15 @@ bool GasCanEnter(MaterialSpec source, uint material) {
     MaterialSpec destination = MaterialSpecs[material];
     return (destination.traits & TRAIT_VALID) != 0u &&
         PhaseOf(destination) == PHASE_LIQUID && source.density < destination.density;
+}
+
+bool GasCanRiseThrough(MaterialSpec source, uint material) {
+    if (material == MATERIAL_EMPTY) return true;
+    MaterialSpec destination = MaterialSpecs[material];
+    if ((destination.traits & TRAIT_VALID) == 0u || source.density >= destination.density)
+        return false;
+    uint phase = PhaseOf(destination);
+    return phase == PHASE_LIQUID || MobilityOf(destination) == MOBILITY_POWDER;
 }
 
 void AppendNowChunk(int2 chunk) {
@@ -420,6 +430,23 @@ uint ScenarioCell(int2 coord) {
                 return MakeCell(MATERIAL_STEAM, (uint2)coord);
             if (coord.y == 28 && coord.x >= 18 && coord.x <= 21)
                 return MakeCellState(MATERIAL_CLOUD, (uint2)coord, 220u + (uint)(coord.x - 18));
+        }
+        if (Push.testCase == 24u) {
+            // Direct powder/gas density swap: Sand must displace Steam down,
+            // while Steam simultaneously rises into the Sand source.
+            if (all(coord == int2(8, 9))) return MakeCell(MATERIAL_SAND, (uint2)coord);
+            if (all(coord == int2(8, 8))) return MakeCell(MATERIAL_STEAM, (uint2)coord);
+        }
+        if (Push.testCase == 25u) {
+            // Steam starts under a three-cell Sand cap in a narrow shaft. It
+            // must climb through powder swaps instead of remaining trapped.
+            if (coord.y == 7 && coord.x >= 7 && coord.x <= 9)
+                return MakeCell(MATERIAL_STONE, (uint2)coord);
+            if ((coord.x == 7 || coord.x == 9) && coord.y >= 8 && coord.y <= 12)
+                return MakeCell(MATERIAL_STONE, (uint2)coord);
+            if (all(coord == int2(8, 8))) return MakeCell(MATERIAL_STEAM, (uint2)coord);
+            if (coord.x == 8 && coord.y >= 9 && coord.y <= 11)
+                return MakeCell(MATERIAL_SAND, (uint2)coord);
         }
         return MakeCell(MATERIAL_EMPTY, (uint2)coord);
     }
@@ -615,7 +642,7 @@ void IntentMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID, ui
         uint period = 1u + FrictionOf(spec) / 4u;
         if ((Push.tick + index) % period == 0u) {
             uint above = MaterialOf(IntentTileCell(coord + int2(0, 1), base));
-            if (GasCanEnter(spec, above)) {
+            if (GasCanRiseThrough(spec, above)) {
                 intent = INTENT_UP;
             } else {
                 bool left = GasCanEnter(spec, MaterialOf(IntentTileCell(coord + int2(-1, 0), base)));
@@ -652,11 +679,44 @@ uint ResolveProposal(int2 coord, int2 base) {
     return Intents[IndexOf(coord)];
 }
 
+void RawConsiderCandidate(int2 source, int2 destination, int2 base, inout uint bestSource, inout uint bestHash) {
+    if (!InBounds(source)) return;
+    uint proposal = ResolveProposal(source, base);
+    uint direction = ProposalDirection(proposal);
+    if (direction == INTENT_STAY || any(IntentTarget(source, direction) != destination)) return;
+    uint sourceIndex = IndexOf(source);
+    uint key = Mix(sourceIndex ^ (Push.tick * 0x9e3779b9u) ^ Push.seed);
+    if (bestSource == INVALID_INDEX || key < bestHash || (key == bestHash && sourceIndex < bestSource)) {
+        bestSource = sourceIndex;
+        bestHash = key;
+    }
+}
+
+uint RawWinnerFor(int2 destination, int2 base) {
+    uint bestSource = INVALID_INDEX;
+    uint bestHash = 0xffffffffu;
+    RawConsiderCandidate(destination + int2(0, 1), destination, base, bestSource, bestHash);
+    RawConsiderCandidate(destination + int2(1, 1), destination, base, bestSource, bestHash);
+    RawConsiderCandidate(destination + int2(-1, 1), destination, base, bestSource, bestHash);
+    RawConsiderCandidate(destination + int2(-1, 0), destination, base, bestSource, bestHash);
+    RawConsiderCandidate(destination + int2(1, 0), destination, base, bestSource, bestHash);
+    RawConsiderCandidate(destination + int2(0, -1), destination, base, bestSource, bestHash);
+    return bestSource;
+}
+
 void ConsiderCandidate(int2 source, int2 destination, int2 base, inout uint bestSource, inout uint bestHash) {
     if (!InBounds(source)) return;
     uint proposal = ResolveProposal(source, base);
     uint direction = ProposalDirection(proposal);
     if (direction == INTENT_STAY || any(IntentTarget(source, direction) != destination)) return;
+
+    uint destinationMaterial = MaterialOf(ResolveCell(destination, base));
+    uint rawIncomingToSource = RawWinnerFor(source, base);
+    bool sourceCanReceiveDisplacedDestination =
+        rawIncomingToSource == INVALID_INDEX || rawIncomingToSource == IndexOf(destination);
+    if (destinationMaterial != MATERIAL_EMPTY && !sourceCanReceiveDisplacedDestination)
+        return;
+
     uint sourceIndex = IndexOf(source);
     uint key = Mix(sourceIndex ^ (Push.tick * 0x9e3779b9u) ^ Push.seed);
     if (bestSource == INVALID_INDEX || key < bestHash || (key == bestHash && sourceIndex < bestSource)) {
@@ -724,13 +784,15 @@ void ResolveMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID, u
         MaterialSpec targetSpec = MaterialSpecs[MaterialOf(targetCell)];
         uint sourcePhase = PhaseOf(sourceSpec);
         uint targetPhase = PhaseOf(targetSpec);
-        bool powderSinks = MobilityOf(sourceSpec) == MOBILITY_POWDER &&
-            targetPhase == PHASE_LIQUID && sourceSpec.density > targetSpec.density;
-        bool gasRises = sourcePhase == PHASE_GAS && targetPhase == PHASE_LIQUID &&
+        bool powderDisplacesLowerDensity = MobilityOf(sourceSpec) == MOBILITY_POWDER &&
+            (targetPhase == PHASE_LIQUID || targetPhase == PHASE_GAS) &&
+            sourceSpec.density > targetSpec.density;
+        bool gasRises = sourcePhase == PHASE_GAS &&
+            (targetPhase == PHASE_LIQUID || MobilityOf(targetSpec) == MOBILITY_POWDER) &&
             sourceSpec.density < targetSpec.density;
         bool liquidFallsThroughGas = sourcePhase == PHASE_LIQUID && targetPhase == PHASE_GAS &&
             sourceSpec.density > targetSpec.density;
-        bool displacesStationaryMaterial = (powderSinks || gasRises || liquidFallsThroughGas) && !targetLeaving;
+        bool displacesStationaryMaterial = (powderDisplacesLowerDensity || gasRises || liquidFallsThroughGas) && !targetLeaving;
         if (displacesStationaryMaterial) {
             output = targetCell;
             outputMotion = ProposalDirection(targetProposal) == INTENT_STAY ?
@@ -1075,6 +1137,16 @@ void ValidateMain(uint3 dispatchId : SV_DispatchThreadID) {
         MaterialOf(Cells[IndexOf(int2(9, 8))]) != MATERIAL_WATER)) result.failures |= 2097152u;
     if (Push.testCase == 23u && result.waterCount + result.steamCount + result.cloudCount != 13u)
         result.failures |= 4194304u;
+    if (Push.testCase == 24u && (result.sandCount != 1u || result.steamCount != 1u ||
+        MaterialOf(Cells[IndexOf(int2(8, 8))]) != MATERIAL_SAND ||
+        MaterialOf(Cells[IndexOf(int2(8, 9))]) != MATERIAL_STEAM))
+        result.failures |= 8388608u;
+    if (Push.testCase == 25u && (result.sandCount != 3u || result.steamCount != 1u ||
+        MaterialOf(Cells[IndexOf(int2(8, 8))]) != MATERIAL_SAND ||
+        MaterialOf(Cells[IndexOf(int2(8, 9))]) != MATERIAL_SAND ||
+        MaterialOf(Cells[IndexOf(int2(8, 10))]) != MATERIAL_SAND ||
+        MaterialOf(Cells[IndexOf(int2(8, 12))]) != MATERIAL_STEAM))
+        result.failures |= 16777216u;
 
     uint chunkCount = Push.chunksX * Push.chunksY;
     if (result.activeCount > chunkCount) result.failures |= 65536u;

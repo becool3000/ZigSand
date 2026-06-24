@@ -148,7 +148,7 @@ Simulation descriptor set 0 contains sixteen storage-buffer bindings:
 
 The renderer exposes four read-only storage buffers at set 0: canonical Cells at binding 0, Motion at 1, Disturbance at 2, and Pressure at 3. Rendering must not bind scratch, intent, or activity buffers. `RenderPush` carries the same enabled-channel bitmask as simulation; disabled debug channels render as zero-valued layers so one-word dummy bindings are never indexed past element zero.
 
-`SimPush` is 64 bytes and `RenderPush` is 32 bytes. All fields are 32-bit values with identical Zig/HLSL ordering.
+`SimPush` is 64 bytes and `RenderPush` is 48 bytes. All fields are 32-bit values with identical Zig/HLSL ordering.
 
 ## 9. Tick pipeline
 
@@ -184,12 +184,12 @@ Supported intents are Stay, Down, DownLeft, DownRight, Left, Right, and Up. Up i
 - Water Pressure is an unsigned 0–255 body channel. Empty-above surface cells release it; submerged cells gather attenuated lateral/lower values and build head from Water above using `pressure_response`.
 - Pressure gradients may bias Water's existing valid lateral choice. Pressure never creates upward movement, compression, duplication, or direct neighbor writes.
 - Steam attempts Up first, then deterministic horizontal spreading. Cloud uses the same gas rule at a slower friction-derived cadence.
-- Density-aware stationary swaps let lower-density gas rise through Water and denser Water fall through Steam or Cloud without changing total material count.
+- Density-aware swaps let Sand displace lower-density Water, Steam, and Cloud; let lower-density gas rise through Water and powder; and let denser Water fall through Steam or Cloud without changing total material count.
 - Supported surface Water uses an integer `(cell, tick, seed)` hash for 1-in-1024 evaporation. Steam becomes Cloud in the upper eighth; Cloud age advances once per 32 ticks and produces Water after 120–247 age steps.
 - Surface-Water and atmospheric chunk halos remain active for scheduled evaporation and age progression; unrelated static chunks still sleep.
 - Stone and Empty emit Stay.
 - Movement is limited to one cell per tick.
-- Sand may target Water.
+- Sand may target Water and lower-density gas.
 - If targeted Water does not successfully leave, it is displaced into the Sand source.
 - If targeted Water successfully leaves, the Sand source becomes Empty.
 
@@ -210,6 +210,7 @@ Losing valid intents remain active for another tick. Movement, painting, and bou
 - Cycle a zero-readback heatmap/debug view without modifying simulation state.
 - Use integer nearest-cell addressing; no filtered cell texture.
 - Preserve the world aspect ratio with centered letterboxing.
+- Apply a CPU-owned camera center and zoom in the fragment shader; simulation coordinates and brush mapping use the same transform.
 - Convert the simulation's bottom-left Y axis to Win32's top-left presentation orientation.
 - Recreate only swapchain-dependent resources on resize or out-of-date results.
 - Rendering cadence is independent of fixed simulation ticks.
@@ -243,6 +244,8 @@ Interactive input:
 | `R` | Restore demo scene |
 | `T` | Toggle uncapped simulation |
 | `V` | Cycle Cells/Motion/Disturbance/Pressure view |
+| `E` / `Q` | Zoom in / out |
+| `WASD` | Pan the camera |
 | Escape | Exit |
 
 Input commands apply at the next tick boundary. The runtime may execute at most four catch-up ticks per rendered frame, then must discard excess accumulated time.
@@ -288,6 +291,8 @@ Headless GPU tests must read back only the compact result structure and must ver
 - Supported Water deterministically converts to Steam without losing H2O mass.
 - Steam rises exactly one cell and aged Cloud converts to Water.
 - A mixed Water/Steam/Cloud fixture conserves total H2O and produces identical layered hashes and material counts over 100 resets.
+- Sand displaces Steam and Steam escapes through a narrow Sand cap without losing Sand or Steam count.
+- 8192-tick atmosphere replays preserve total H2O in both the default world and a compact Water/Steam/Cloud fixture.
 - Pressure-only and Disturbance-only channel configurations exercise their separate commit-owner branches.
 - Disabling MotionChannel, DisturbanceChannel, and PressureChannel preserves cell-only behavior with one-word dummy buffers.
 
@@ -314,7 +319,7 @@ The following require a new or revised specification before implementation:
 - Linux windowing and presentation.
 - Separate async-compute queues.
 - Timeline-semaphore multi-frame presentation.
-- Zoom, pan, camera transforms, or UI framework adoption.
+- UI framework adoption.
 - Temperature, fire, reactions, compressible fluids, upward Water motion, or continuous fluids.
 - Wave-intrinsic, block-movement, or alternate atomic kernels.
 - GPU replay/capture formats.

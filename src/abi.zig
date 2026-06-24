@@ -140,6 +140,10 @@ pub const RenderPush = extern struct {
     seed: u32,
     view_mode: u32 = @intFromEnum(RenderView.cells),
     channel_flags: u32 = channel_motion | channel_disturbance | channel_pressure,
+    camera_center_x: f32 = 0,
+    camera_center_y: f32 = 0,
+    zoom: f32 = 1,
+    reserved2: u32 = 0,
 };
 
 pub const TestResult = extern struct {
@@ -191,7 +195,7 @@ pub fn pressureBytes(width: u32, height: u32) u64 {
 test "GPU ABI is stable" {
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(Cell));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SimPush));
-    try std.testing.expectEqual(@as(usize, 32), @sizeOf(RenderPush));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(RenderPush));
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(TestResult));
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(Motion));
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(Disturbance));
@@ -247,6 +251,7 @@ test "render-view encodings are stable" {
         .seed = 0,
     };
     try std.testing.expectEqual(channel_motion | channel_disturbance | channel_pressure, push.channel_flags);
+    try std.testing.expectEqual(@as(f32, 1), push.zoom);
 }
 
 test "disturbance packing" {

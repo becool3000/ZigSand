@@ -12,6 +12,12 @@ pub const Key = enum(u8) {
     one = '1',
     two = '2',
     three = '3',
+    q = 'Q',
+    w = 'W',
+    e = 'E',
+    a = 'A',
+    s = 'S',
+    d = 'D',
     clear = 'C',
     reset = 'R',
     turbo = 'T',
@@ -31,6 +37,7 @@ pub const Window = struct {
     right_down: bool = false,
     wheel_steps: i32 = 0,
     pressed: [256]bool = .{false} ** 256,
+    down: [256]bool = .{false} ** 256,
 
     pub fn init(self: *Window, width: u32, height: u32) !void {
         self.* = .{
@@ -98,6 +105,10 @@ pub const Window = struct {
         const value = self.pressed[index];
         self.pressed[index] = false;
         return value;
+    }
+
+    pub fn isDown(self: *const Window, key: Key) bool {
+        return self.down[@intFromEnum(key)];
     }
 
     pub fn consumeWheel(self: *Window) i32 {
@@ -192,8 +203,16 @@ fn windowProc(hwnd: c.HWND, message: c.UINT, wparam: c.WPARAM, lparam: c.LPARAM)
             return 0;
         },
         c.WM_KEYDOWN => {
-            if ((@as(usize, @bitCast(lparam)) & (@as(usize, 1) << 30)) == 0 and wparam < self.pressed.len)
-                self.pressed[@intCast(wparam)] = true;
+            if (wparam < self.pressed.len) {
+                self.down[@intCast(wparam)] = true;
+                if ((@as(usize, @bitCast(lparam)) & (@as(usize, 1) << 30)) == 0)
+                    self.pressed[@intCast(wparam)] = true;
+            }
+            return 0;
+        },
+        c.WM_KEYUP => {
+            if (wparam < self.down.len)
+                self.down[@intCast(wparam)] = false;
             return 0;
         },
         else => {},

@@ -43,6 +43,8 @@ Runtime options are `--width`, `--height`, `--tps`, `--seed`, `--validation`, `-
 - `R`: restore the demo scene
 - `T`: toggle uncapped simulation
 - `V`: cycle Cells, Motion, Disturbance, and Pressure GPU views
+- `E` / `Q`: zoom in / out
+- `WASD`: pan while zoomed
 - Escape: quit
 
 ## Architecture
@@ -60,7 +62,7 @@ One fixed simulation tick executes:
 7. Commit scratch cells, participating Disturbance proposals, and local atmosphere phase changes together, only for current active chunks.
 8. Swap active-list handles, never the world grids.
 
-Sand and Water move at most one cell per tick. Sand can displace stationary Water. Water remains gravity-first and never moves upward, preventing pressure feedback from creating floating clumps. Steam rises and Cloud drifts using gas mobility; density swaps let vapor rise through Water and rain fall through gas. Workgroup-shared halo tiles reduce repeated global reads, atomic flag transitions prevent duplicate active chunks, and atomics never decide cell outcomes. Rendering reads canonical channel buffers directly in the fragment shader, including the zero-readback debug views.
+Sand and Water move at most one cell per tick. Sand can displace stationary Water and lower-density gas, while Steam can rise through Sand by the same deterministic density-swap resolver. Water remains gravity-first and never moves upward, preventing pressure feedback from creating floating clumps. Steam rises and Cloud drifts using gas mobility; density swaps let vapor rise through Water and rain fall through gas. Workgroup-shared halo tiles reduce repeated global reads, atomic flag transitions prevent duplicate active chunks, and atomics never decide cell outcomes. Rendering reads canonical channel buffers directly in the fragment shader, including the zero-readback debug views.
 
 ### Trait-driven simulation systems
 
@@ -85,7 +87,7 @@ Disturbance is also one `u32` per cell, currently using only four energy bits. I
 
 Supported surface Water evaporates with a deterministic 1-in-1024 per-tick integer hash. Steam rises first and spreads sideways when blocked. Entering the upper eighth of the world converts it to Cloud. Cloud age lives in the existing cell-state byte, advances once every 32 ticks, and converts to Water after a variant-dependent threshold of 120–247 age steps. This slower age cadence lets clouds form a dense ceiling even in uncapped mode; uncapped simply reaches the same tick-defined equilibrium much faster in wall time. Water, Steam, and Cloud counts remain mass-conserving.
 
-The test command runs host ABI/CLI/layout/coordinate/manifest tests plus shader-side GPU tests. GPU readback is limited to a 56-byte result record and a 4-byte active-count statistic. Disturbance, Pressure, and mixed atmospheric fixtures are reset and replayed 100 times, comparing all canonical channel hashes, Water/Steam/Cloud counts, and active counts without reading back the grid. Benchmark mode forces all chunks active, warms up for two wall-clock seconds, then measures for ten seconds by default.
+The test command runs host ABI/CLI/layout/coordinate/manifest tests plus shader-side GPU tests. GPU readback is limited to a 56-byte result record and a 4-byte active-count statistic. Disturbance, Pressure, Sand/Steam swaps, and mixed atmospheric fixtures are reset and replayed without reading back the grid. The atmosphere suite includes 8192-tick H2O mass-conservation replays for both the default world and a compact Water/Steam/Cloud fixture. Benchmark mode forces all chunks active, warms up for two wall-clock seconds, then measures for ten seconds by default.
 
 ## Layout
 

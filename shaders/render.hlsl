@@ -7,6 +7,10 @@ struct RenderPush {
     uint seed;
     uint viewMode;
     uint channelFlags;
+    float cameraCenterX;
+    float cameraCenterY;
+    float zoom;
+    uint reserved2;
 };
 
 static const uint CHANNEL_MOTION = 1u;
@@ -125,15 +129,22 @@ float3 WaterWithMotionFoam(uint cell, uint motion, uint2 coord) {
 }
 
 float4 FragmentMain(float4 position : SV_Position) : SV_Target0 {
-    float scale = min((float)Push.viewportWidth / (float)Push.width, (float)Push.viewportHeight / (float)Push.height);
-    float2 drawSize = float2((float)Push.width, (float)Push.height) * scale;
+    float zoom = max(Push.zoom, 1.0);
+    float2 viewWorldSize = float2((float)Push.width, (float)Push.height) / zoom;
+    float scale = min((float)Push.viewportWidth / viewWorldSize.x, (float)Push.viewportHeight / viewWorldSize.y);
+    float2 drawSize = viewWorldSize * scale;
     float2 offset = (float2((float)Push.viewportWidth, (float)Push.viewportHeight) - drawSize) * 0.5;
     float2 local = position.xy - offset;
     if (local.x < 0.0 || local.y < 0.0 || local.x >= drawSize.x || local.y >= drawSize.y)
         return float4(0.002, 0.003, 0.005, 1.0);
+    float2 viewMin = float2(Push.cameraCenterX, Push.cameraCenterY) - viewWorldSize * 0.5;
+    float worldX = viewMin.x + local.x / scale;
+    float worldY = viewMin.y + viewWorldSize.y - local.y / scale - 0.0001;
+    if (worldX < 0.0 || worldY < 0.0 || worldX >= (float)Push.width || worldY >= (float)Push.height)
+        return float4(0.002, 0.003, 0.005, 1.0);
     uint2 coord;
-    coord.x = min((uint)(local.x / scale), Push.width - 1u);
-    coord.y = Push.height - 1u - min((uint)(local.y / scale), Push.height - 1u);
+    coord.x = min((uint)worldX, Push.width - 1u);
+    coord.y = min((uint)worldY, Push.height - 1u);
     uint index = coord.y * Push.paddedWidth + coord.x;
     uint cell = Cells[index];
     uint motion = 0u;
