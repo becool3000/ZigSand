@@ -7,7 +7,7 @@ Target: Windows x64, AMD Radeon RX 5700 XT or equivalent Vulkan 1.3 GPU
 
 ZigSand is a GPU-owned, deterministic falling-sand sandbox. The CPU manages the window, input, scheduling, resource lifetime, and compact tick parameters. It does not simulate cells, retain a mirrored world, colorize frames, or read the world grid back from the GPU.
 
-The baseline materials are Empty, Sand, Water, and Stone. Simulation and rendering share one canonical GPU cell buffer.
+The baseline materials are Empty, Sand, Water, Stone, Steam, and Cloud. Simulation and rendering share one canonical GPU cell buffer.
 
 ## 2. Pinned stack
 
@@ -95,11 +95,13 @@ Material IDs are stable:
 1 Sand
 2 Water
 3 Stone
+4 Steam
+5 Cloud
 ```
 
 Changing IDs, buffer element widths, push-constant fields, or structure packing is an ABI change and requires matching Zig and HLSL edits plus ABI tests.
 
-Each valid material also has one immutable 32-byte `MaterialSpec`, indexed by its stable ID in a 256-entry GPU table. It stores packed phase/mobility/flags, four-bit dynamics traits, integer density and resistance, milli-degree Celsius defaults and ignition threshold, heat capacity, and a future reaction-table range. The dynamics traits are friction, motion decay, pressure response, disturbance decay, and surface response; Water and Sand currently consume friction and motion decay. Current temperature, pressure, charge, and other evolving values require separate canonical GPU channels.
+Each valid material also has one immutable 32-byte `MaterialSpec`, indexed by its stable ID in a 256-entry GPU table. It stores packed phase/mobility/flags, four-bit dynamics traits, integer density and resistance, milli-degree Celsius defaults and ignition threshold, heat capacity, and a future reaction-table range. The dynamics traits are friction, motion decay, pressure response, disturbance decay, and surface response. Water consumes pressure response and emits slowly decaying surface disturbance; Sand blocks pressure; Steam and Cloud use gas phase/mobility with friction controlling movement cadence. Current temperature, charge, and other evolving values require separate canonical GPU channels. Cloud age is small material-local state and occupies the existing cell flags byte.
 
 ## 7. World memory contract
 
@@ -112,14 +114,18 @@ Each valid material also has one immutable 32-byte `MaterialSpec`, indexed by it
 - The canonical grid is never globally swapped or copied for presentation.
 - MotionChannel is optional canonical `u32` storage: three direction bits, four strength bits, and zeroed reserved bits.
 - Enabled MotionChannel storage adds 7.969 MiB at 1920×1080 and has no second motion scratch grid.
-- Rendering reads the canonical buffer directly.
+- DisturbanceChannel is optional canonical `u32` storage: four energy bits and zeroed reserved bits.
+- Enabled DisturbanceChannel storage adds 7.969 MiB at 1920×1080. Its proposals reuse the movement-intent grid after movement resolution, so there is no separate disturbance scratch allocation.
+- PressureChannel is optional canonical `u32` storage: eight magnitude bits and zeroed reserved bits.
+- Enabled PressureChannel storage adds 7.969 MiB at 1920×1080. Its proposals reuse the movement-intent grid before Disturbance; there is no pressure scratch allocation or standalone pressure-commit dispatch.
+- Rendering reads canonical Cells, Motion, Disturbance, or Pressure directly according to the selected debug view.
 - CPU readback is restricted to compact statistics and test result records.
 
 No application heap allocation may occur during a normal simulation tick or rendered frame. Startup allocation and swapchain-only resize allocation are permitted.
 
 ## 8. Shader descriptor contract
 
-Simulation descriptor set 0 contains fourteen storage-buffer bindings:
+Simulation descriptor set 0 contains sixteen storage-buffer bindings:
 
 | Binding | Buffer |
 |---:|---|
@@ -137,8 +143,10 @@ Simulation descriptor set 0 contains fourteen storage-buffer bindings:
 | 11 | Compact GPU test result |
 | 12 | Read-only material specifications |
 | 13 | Optional canonical MotionChannel, or a one-word dummy binding when disabled |
+| 14 | Optional canonical DisturbanceChannel, or a one-word dummy binding when disabled |
+| 15 | Optional canonical PressureChannel, or a one-word dummy binding when disabled |
 
-The renderer exposes only canonical cells at set 0, binding 0. Rendering must not bind scratch, intent, or activity buffers.
+The renderer exposes four read-only storage buffers at set 0: canonical Cells at binding 0, Motion at 1, Disturbance at 2, and Pressure at 3. Rendering must not bind scratch, intent, or activity buffers. `RenderPush` carries the same enabled-channel bitmask as simulation; disabled debug channels render as zero-valued layers so one-word dummy bindings are never indexed past element zero.
 
 `SimPush` is 64 bytes and `RenderPush` is 32 bytes. All fields are 32-bit values with identical Zig/HLSL ordering.
 
@@ -152,22 +160,33 @@ Chunks and compute workgroups are 16×16 cells. A fixed simulation tick executes
 4. Dispatch `IntentMain` indirectly over the compact current list; proposals contain direction plus accepted/rejected Motion outcomes.
 5. Barrier compute writes before resolution reads.
 6. Dispatch `ResolveMain` indirectly over the same current list and commit destination-owned Motion after all channel reads have completed.
-7. Barrier scratch and activity writes before commit.
-8. Dispatch `CommitMain` indirectly over current active chunks only.
-9. Copy the next active count into its four-byte asynchronous statistic slot.
-10. Swap current/next activity roles on the host; never swap cell grids.
+7. Barrier resolved scratch and Motion writes before layered-channel reads.
+8. Dispatch `PressureMain` over current active chunks. It gathers from resolved topology and canonical PressureChannel into the now-free movement-intent grid.
+9. Barrier Pressure proposals before `DisturbanceMain`, which commits destination-owned Pressure and then reuses the same grid for marked Disturbance proposals.
+10. Barrier scratch, layered proposals, and activity writes before commit.
+11. Dispatch `CommitMain` indirectly over current active chunks only; it commits cells, participating Disturbance proposals, and destination-owned atmosphere phase changes in one pass. If Disturbance is disabled, this pass directly commits Pressure proposals instead.
+12. Copy the next active count into its four-byte asynchronous statistic slot.
+13. Swap current/next activity roles on the host; never swap cell grids.
 
 The simulation rotates three preallocated command-buffer, fence, timestamp-query, and statistic slots. Timing collection may wait only when reusing an in-flight slot; it must not use query-result `WAIT` behavior.
 
 ## 10. Movement and determinism
 
-Supported intents are Stay, Down, DownLeft, DownRight, Left, and Right.
+Supported intents are Stay, Down, DownLeft, DownRight, Left, Right, and Up. Up is emitted only by gas mobility.
 
 - Powder mobility attempts Down first, then one valid diagonal; Sand is the first material using this trait-driven path.
-- Sand's short-lived Motion biases a valid diagonal after an avalanche begins. Accepted tendency decays quickly, while rejection or forced redirection is exhausted by high friction.
+- Sand's short-lived Motion biases a valid diagonal after an avalanche begins. Accepted tendency lasts several moves, while rejection or forced redirection damps much faster than Water.
 - Water attempts Down first, then one valid horizontal side.
 - Water's nonzero Motion direction biases valid lateral choices; accepted motion decays by `motion_decay`, while rejection or redirection also applies `friction`.
 - Motion never permits an otherwise invalid cell move, and fully blocked motion decays to zero so chunks can sleep.
+- Surface Water gathers unsigned Disturbance energy from itself and horizontal surface neighbors. Local Motion emits energy according to `surface_response`; `disturbance_decay` removes it deterministically.
+- Disturbance may perturb Water's deterministic preferred side, but it never changes occupancy validity, collision priority, or the one-cell-per-tick limit. Non-Water cells clear the channel.
+- Water Pressure is an unsigned 0–255 body channel. Empty-above surface cells release it; submerged cells gather attenuated lateral/lower values and build head from Water above using `pressure_response`.
+- Pressure gradients may bias Water's existing valid lateral choice. Pressure never creates upward movement, compression, duplication, or direct neighbor writes.
+- Steam attempts Up first, then deterministic horizontal spreading. Cloud uses the same gas rule at a slower friction-derived cadence.
+- Density-aware stationary swaps let lower-density gas rise through Water and denser Water fall through Steam or Cloud without changing total material count.
+- Supported surface Water uses an integer `(cell, tick, seed)` hash for 1-in-1024 evaporation. Steam becomes Cloud in the upper eighth; Cloud age advances once per 32 ticks and produces Water after 120–247 age steps.
+- Surface-Water and atmospheric chunk halos remain active for scheduled evaporation and age progression; unrelated static chunks still sleep.
 - Stone and Empty emit Stay.
 - Movement is limited to one cell per tick.
 - Sand may target Water.
@@ -187,7 +206,8 @@ Losing valid intents remain active for another tick. Movement, painting, and bou
 ## 11. Rendering contract
 
 - Render with one fullscreen triangle and Vulkan dynamic rendering.
-- Read cells directly as a storage buffer in the fragment shader.
+- Read canonical Cells, Motion, Disturbance, and Pressure directly as storage buffers in the fragment shader.
+- Cycle a zero-readback heatmap/debug view without modifying simulation state.
 - Use integer nearest-cell addressing; no filtered cell texture.
 - Preserve the world aspect ratio with centered letterboxing.
 - Convert the simulation's bottom-left Y axis to Win32's top-left presentation orientation.
@@ -222,9 +242,12 @@ Interactive input:
 | `C` | Clear world |
 | `R` | Restore demo scene |
 | `T` | Toggle uncapped simulation |
+| `V` | Cycle Cells/Motion/Disturbance/Pressure view |
 | Escape | Exit |
 
 Input commands apply at the next tick boundary. The runtime may execute at most four catch-up ticks per rendered frame, then must discard excess accumulated time.
+
+Uncapped mode remains opt-in during tuning but is the intended eventual default presentation. Atmospheric rates are defined in ticks, so uncapped mode reaches the same deterministic cloud/rain equilibrium faster rather than skipping simulation states.
 
 ## 13. Test specification
 
@@ -238,6 +261,8 @@ Host tests must cover:
 - Shader manifest completeness and embedded SPIR-V discovery.
 - Material-spec size, offsets, trait encodings, stable IDs, duplicate rejection, and reaction ranges.
 - Packed Motion and movement-proposal ABI values.
+- Packed Disturbance ABI values.
+- Packed Pressure ABI values.
 
 Headless GPU tests must read back only the compact result structure and must verify:
 
@@ -255,10 +280,16 @@ Headless GPU tests must read back only the compact result structure and must ver
 - Active lists contain no duplicate or out-of-range IDs.
 - Non-multiple-of-16 worlds retain solid padded boundaries.
 - A cross-chunk collision scenario produces identical hashes, counts, and active count across 100 independent reset/replay runs.
-- The determinism state hash processes canonical cells first and MotionChannel second, with separate component hashes retained in the compact result.
+- The determinism state hash processes canonical Cells, MotionChannel, DisturbanceChannel, then PressureChannel in that fixed order, with separate component hashes retained in the compact result.
 - A falling-Water basin fixture retains material counts, exercises lateral Motion, and produces stable layered hashes over 100 resets.
 - A falling-Sand shelf fixture retains material counts, exercises diagonal Motion, and produces stable layered hashes over 100 resets.
-- Disabling MotionChannel preserves cell-only behavior with a one-word dummy buffer.
+- A shallow Water basin fixture emits and propagates surface Disturbance and produces stable Cells/Motion/Disturbance hashes over 100 resets.
+- A deep Water basin fixture builds nonzero integer head pressure while retaining material counts and produces stable four-layer hashes over 100 resets.
+- Supported Water deterministically converts to Steam without losing H2O mass.
+- Steam rises exactly one cell and aged Cloud converts to Water.
+- A mixed Water/Steam/Cloud fixture conserves total H2O and produces identical layered hashes and material counts over 100 resets.
+- Pressure-only and Disturbance-only channel configurations exercise their separate commit-owner branches.
+- Disabling MotionChannel, DisturbanceChannel, and PressureChannel preserves cell-only behavior with one-word dummy buffers.
 
 ## 14. Performance acceptance
 
@@ -274,7 +305,7 @@ On the RX 5700 XT at 1920×1080:
 
 Benchmark mode must force every chunk active, warm up for two wall-clock seconds, measure for ten seconds by default, and report sample count, median, p95, and active/total chunks.
 
-The implemented RX 5700 XT reference result is 0.390 ms median and 0.473 ms p95 for 8160/8160 chunks. This number is evidence, not a portable guarantee.
+The RX 5700 XT fully active atmosphere build measures 0.780 ms median and 0.798 ms p95 for 8160/8160 chunks (11,069 samples after warmup). These measurements are evidence, not portable guarantees, and remain far below the 16.67 ms acceptance ceiling.
 
 ## 15. Deferred stack changes
 
@@ -284,7 +315,7 @@ The following require a new or revised specification before implementation:
 - Separate async-compute queues.
 - Timeline-semaphore multi-frame presentation.
 - Zoom, pan, camera transforms, or UI framework adoption.
-- Temperature, fire, reactions, pressure, or continuous fluids.
+- Temperature, fire, reactions, compressible fluids, upward Water motion, or continuous fluids.
 - Wave-intrinsic, block-movement, or alternate atomic kernels.
 - GPU replay/capture formats.
 

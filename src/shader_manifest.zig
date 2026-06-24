@@ -13,14 +13,16 @@ pub const shaders = [_]Shader{
     .{ .name = "paint_spv", .source = "shaders/sim.hlsl", .entry = "PaintMain", .profile = "cs_6_6" },
     .{ .name = "intent_spv", .source = "shaders/sim.hlsl", .entry = "IntentMain", .profile = "cs_6_6" },
     .{ .name = "resolve_spv", .source = "shaders/sim.hlsl", .entry = "ResolveMain", .profile = "cs_6_6" },
+    .{ .name = "pressure_spv", .source = "shaders/sim.hlsl", .entry = "PressureMain", .profile = "cs_6_6" },
     .{ .name = "commit_spv", .source = "shaders/sim.hlsl", .entry = "CommitMain", .profile = "cs_6_6" },
+    .{ .name = "disturbance_spv", .source = "shaders/sim.hlsl", .entry = "DisturbanceMain", .profile = "cs_6_6" },
     .{ .name = "validate_spv", .source = "shaders/sim.hlsl", .entry = "ValidateMain", .profile = "cs_6_6" },
     .{ .name = "vertex_spv", .source = "shaders/render.hlsl", .entry = "VertexMain", .profile = "vs_6_0" },
     .{ .name = "fragment_spv", .source = "shaders/render.hlsl", .entry = "FragmentMain", .profile = "ps_6_0" },
 };
 
 test "shader manifest is complete and unique" {
-    try std.testing.expect(shaders.len == 9);
+    try std.testing.expect(shaders.len == 11);
     for (shaders, 0..) |shader, index| {
         try std.testing.expect(shader.name.len != 0 and shader.entry.len != 0 and shader.source.len != 0);
         for (shaders[index + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, shader.name, other.name));

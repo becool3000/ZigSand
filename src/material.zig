@@ -88,6 +88,10 @@ pub const MaterialSpec = extern struct {
         return (self.traits & trait_uses_motion) != 0;
     }
 
+    pub fn blocksPressure(self: MaterialSpec) bool {
+        return (self.traits & trait_blocks_pressure) != 0;
+    }
+
     pub fn friction(self: MaterialSpec) u4 {
         return @truncate(self.traits >> trait_friction_shift);
     }
@@ -140,16 +144,21 @@ pub const MaterialRegistry = struct {
             .phase = .solid,
             .mobility = .powder,
             .uses_motion = true,
-            .friction = 12,
-            .motion_decay = 3,
+            .blocks_pressure = true,
+            .friction = 4,
+            .motion_decay = 2,
+            .disturbance_decay = 8,
         }, 1600, std.math.maxInt(u32), 20_000, 830, no_ignition_temperature)) catch unreachable;
         registry.add(@intFromEnum(abi.Material.water), MaterialSpec.init(.{
             .phase = .liquid,
             .mobility = .fluid,
             .uses_motion = true,
             .conductive = true,
-            .friction = 2,
+            .friction = 0,
             .motion_decay = 1,
+            .pressure_response = 4,
+            .disturbance_decay = 1,
+            .surface_response = 8,
         }, 1000, 1000, 20_000, 4184, no_ignition_temperature)) catch unreachable;
         registry.add(@intFromEnum(abi.Material.stone), MaterialSpec.init(.{
             .phase = .solid,
@@ -157,7 +166,22 @@ pub const MaterialRegistry = struct {
             .blocks_pressure = true,
             .friction = 15,
             .motion_decay = 15,
+            .disturbance_decay = 15,
         }, 2600, std.math.maxInt(u32), 20_000, 790, no_ignition_temperature)) catch unreachable;
+        registry.add(@intFromEnum(abi.Material.steam), MaterialSpec.init(.{
+            .phase = .gas,
+            .mobility = .gas,
+            .friction = 0,
+            .motion_decay = 15,
+            .disturbance_decay = 15,
+        }, 1, std.math.maxInt(u32), 100_000, 2010, no_ignition_temperature)) catch unreachable;
+        registry.add(@intFromEnum(abi.Material.cloud), MaterialSpec.init(.{
+            .phase = .gas,
+            .mobility = .gas,
+            .friction = 8,
+            .motion_decay = 15,
+            .disturbance_decay = 15,
+        }, 2, std.math.maxInt(u32), 20_000, 4184, no_ignition_temperature)) catch unreachable;
         registry.validate(&.{}) catch unreachable;
         return registry;
     }
@@ -259,16 +283,30 @@ test "material GPU ABI and trait encoding are stable" {
     try std.testing.expectEqual(Mobility.powder, sand.mobility());
     try std.testing.expectEqual(@as(u32, 1600), sand.density);
     try std.testing.expect(sand.usesMotion());
-    try std.testing.expectEqual(@as(u4, 12), sand.friction());
-    try std.testing.expectEqual(@as(u4, 3), sand.motionDecay());
+    try std.testing.expect(sand.blocksPressure());
+    try std.testing.expectEqual(@as(u4, 4), sand.friction());
+    try std.testing.expectEqual(@as(u4, 2), sand.motionDecay());
 
     const water = registry.get(@intFromEnum(abi.Material.water)).?;
     try std.testing.expect(water.usesMotion());
-    try std.testing.expectEqual(@as(u4, 2), water.friction());
+    try std.testing.expect(!water.blocksPressure());
+    try std.testing.expectEqual(@as(u4, 0), water.friction());
     try std.testing.expectEqual(@as(u4, 1), water.motionDecay());
-    try std.testing.expectEqual(@as(u4, 0), water.pressureResponse());
-    try std.testing.expectEqual(@as(u4, 0), water.disturbanceDecay());
-    try std.testing.expectEqual(@as(u4, 0), water.surfaceResponse());
+    try std.testing.expectEqual(@as(u4, 4), water.pressureResponse());
+    try std.testing.expectEqual(@as(u4, 1), water.disturbanceDecay());
+    try std.testing.expectEqual(@as(u4, 8), water.surfaceResponse());
+
+    const steam = registry.get(@intFromEnum(abi.Material.steam)).?;
+    try std.testing.expectEqual(Phase.gas, steam.phase());
+    try std.testing.expectEqual(Mobility.gas, steam.mobility());
+    try std.testing.expectEqual(@as(u32, 1), steam.density);
+
+    const cloud = registry.get(@intFromEnum(abi.Material.cloud)).?;
+    try std.testing.expectEqual(Phase.gas, cloud.phase());
+    try std.testing.expectEqual(@as(u4, 8), cloud.friction());
+
+    const stone = registry.get(@intFromEnum(abi.Material.stone)).?;
+    try std.testing.expect(stone.blocksPressure());
 }
 
 test "material registry rejects duplicates and invalid reaction ranges" {
@@ -288,5 +326,5 @@ test "material registry lists only defined stable IDs" {
         try std.testing.expectEqual(expected_id, entry.id);
         try std.testing.expect(entry.spec.isValid());
     }
-    try std.testing.expectEqual(@as(u8, 4), expected_id);
+    try std.testing.expectEqual(@as(u8, 6), expected_id);
 }

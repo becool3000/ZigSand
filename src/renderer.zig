@@ -16,7 +16,9 @@ pub const Renderer = struct {
     padded_width: u32,
     seed: u32,
     cells: vk.Buffer,
+    channel_flags: u32,
     prefer_immediate: bool,
+    view_mode: abi.RenderView = .cells,
 
     descriptor_layout: vk.DescriptorSetLayout,
     descriptor_pool: vk.DescriptorPool,
@@ -47,6 +49,10 @@ pub const Renderer = struct {
         padded_width: u32,
         seed: u32,
         cells: vk.Buffer,
+        motion: vk.Buffer,
+        disturbance: vk.Buffer,
+        pressure: vk.Buffer,
+        channel_flags: u32,
         client_width: u32,
         client_height: u32,
         prefer_immediate: bool,
@@ -59,17 +65,20 @@ pub const Renderer = struct {
         self.padded_width = padded_width;
         self.seed = seed;
         self.cells = cells;
+        self.channel_flags = channel_flags;
         self.prefer_immediate = prefer_immediate;
 
+        var bindings: [4]vk.DescriptorSetLayoutBinding = undefined;
+        for (&bindings, 0..) |*binding, index| binding.* = .{
+            .binding = @intCast(index),
+            .descriptor_type = .storage_buffer,
+            .descriptor_count = 1,
+            .stage_flags = .{ .fragment_bit = true },
+            .p_immutable_samplers = null,
+        };
         self.descriptor_layout = try ctx.device.createDescriptorSetLayout(&.{
-            .binding_count = 1,
-            .p_bindings = &.{.{
-                .binding = 0,
-                .descriptor_type = .storage_buffer,
-                .descriptor_count = 1,
-                .stage_flags = .{ .fragment_bit = true },
-                .p_immutable_samplers = null,
-            }},
+            .binding_count = bindings.len,
+            .p_bindings = &bindings,
         }, null);
         errdefer ctx.device.destroyDescriptorSetLayout(self.descriptor_layout, null);
         self.pipeline_layout = try ctx.device.createPipelineLayout(&.{
@@ -86,7 +95,7 @@ pub const Renderer = struct {
         self.descriptor_pool = try ctx.device.createDescriptorPool(&.{
             .max_sets = 1,
             .pool_size_count = 1,
-            .p_pool_sizes = &.{.{ .type = .storage_buffer, .descriptor_count = 1 }},
+            .p_pool_sizes = &.{.{ .type = .storage_buffer, .descriptor_count = 4 }},
         }, null);
         errdefer ctx.device.destroyDescriptorPool(self.descriptor_pool, null);
         try ctx.device.allocateDescriptorSets(&.{
@@ -94,17 +103,23 @@ pub const Renderer = struct {
             .descriptor_set_count = 1,
             .p_set_layouts = @ptrCast(&self.descriptor_layout),
         }, @ptrCast(&self.descriptor_set));
-        const buffer_info = vk.DescriptorBufferInfo{ .buffer = cells, .offset = 0, .range = vk.WHOLE_SIZE };
-        ctx.device.updateDescriptorSets(&.{.{
-            .dst_set = self.descriptor_set,
-            .dst_binding = 0,
-            .dst_array_element = 0,
-            .descriptor_count = 1,
-            .descriptor_type = .storage_buffer,
-            .p_image_info = undefined,
-            .p_buffer_info = @ptrCast(&buffer_info),
-            .p_texel_buffer_view = undefined,
-        }}, null);
+        const buffers = [_]vk.Buffer{ cells, motion, disturbance, pressure };
+        var buffer_infos: [4]vk.DescriptorBufferInfo = undefined;
+        var writes: [4]vk.WriteDescriptorSet = undefined;
+        for (buffers, 0..) |buffer, binding| {
+            buffer_infos[binding] = .{ .buffer = buffer, .offset = 0, .range = vk.WHOLE_SIZE };
+            writes[binding] = .{
+                .dst_set = self.descriptor_set,
+                .dst_binding = @intCast(binding),
+                .dst_array_element = 0,
+                .descriptor_count = 1,
+                .descriptor_type = .storage_buffer,
+                .p_image_info = undefined,
+                .p_buffer_info = @ptrCast(&buffer_infos[binding]),
+                .p_texel_buffer_view = undefined,
+            };
+        }
+        ctx.device.updateDescriptorSets(&writes, null);
 
         self.command_pool = try ctx.device.createCommandPool(&.{
             .flags = .{ .reset_command_buffer_bit = true },
@@ -129,6 +144,7 @@ pub const Renderer = struct {
         self.initialized = &.{};
         self.render_done = &.{};
         self.last_render_ms = 0;
+        self.view_mode = .cells;
         errdefer self.destroySwapchain();
         try self.recreate(client_width, client_height);
         return self;
@@ -275,6 +291,19 @@ pub const Renderer = struct {
         try self.recreate(width, height);
     }
 
+    pub fn cycleView(self: *Renderer) void {
+        self.view_mode = switch (self.view_mode) {
+            .cells => .motion,
+            .motion => .disturbance,
+            .disturbance => .pressure,
+            .pressure => .cells,
+        };
+    }
+
+    pub fn viewName(self: *const Renderer) []const u8 {
+        return @tagName(self.view_mode);
+    }
+
     /// Acquisition is deliberately non-blocking: while the compositor owns all
     /// swapchain images, the application can spend that time simulating.
     pub fn draw(self: *Renderer) !DrawResult {
@@ -368,6 +397,8 @@ pub const Renderer = struct {
             .viewport_width = self.extent.width,
             .viewport_height = self.extent.height,
             .seed = self.seed,
+            .view_mode = @intFromEnum(self.view_mode),
+            .channel_flags = self.channel_flags,
         };
         self.ctx.device.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .fragment_bit = true }, 0, @sizeOf(abi.RenderPush), &push);
         self.ctx.device.cmdDraw(self.command_buffer, 3, 1, 0, 0);

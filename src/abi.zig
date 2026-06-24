@@ -9,6 +9,8 @@ pub const Material = enum(u8) {
     sand = 1,
     water = 2,
     stone = 3,
+    steam = 4,
+    cloud = 5,
 };
 
 pub const Intent = enum(u32) {
@@ -18,6 +20,7 @@ pub const Intent = enum(u32) {
     down_right = 3,
     left = 4,
     right = 5,
+    up = 6,
 };
 
 /// Motion uses the same direction numbering as Intent so the low proposal bits
@@ -29,6 +32,14 @@ pub const MotionDirection = enum(u3) {
     down_right = 3,
     left = 4,
     right = 5,
+    up = 6,
+};
+
+pub const RenderView = enum(u32) {
+    cells = 0,
+    motion = 1,
+    disturbance = 2,
+    pressure = 3,
 };
 
 /// Canonical optional per-cell movement tendency. Only the low seven bits are
@@ -39,6 +50,28 @@ pub const Motion = packed struct(u32) {
     reserved: u25 = 0,
 
     pub fn bits(self: Motion) u32 {
+        return @bitCast(self);
+    }
+};
+
+/// Canonical optional surface-energy layer. V1 intentionally uses only four
+/// bits so propagation remains integer, bounded, and easy to hash.
+pub const Disturbance = packed struct(u32) {
+    energy: u4 = 0,
+    reserved: u28 = 0,
+
+    pub fn bits(self: Disturbance) u32 {
+        return @bitCast(self);
+    }
+};
+
+/// Canonical optional body-pressure layer. V0 uses one unsigned byte while the
+/// remaining bits stay zero for future range or flag expansion.
+pub const Pressure = packed struct(u32) {
+    amount: u8 = 0,
+    reserved: u24 = 0,
+
+    pub fn bits(self: Pressure) u32 {
         return @bitCast(self);
     }
 };
@@ -66,6 +99,10 @@ pub const Cell = packed struct(u32) {
 
     pub fn make(material: Material, variant: u8) Cell {
         return .{ .material = material, .variant = variant };
+    }
+
+    pub fn makeWithState(material: Material, variant: u8, state: u8) Cell {
+        return .{ .material = material, .variant = variant, .flags = state };
     }
 
     pub fn bits(self: Cell) u32 {
@@ -101,8 +138,8 @@ pub const RenderPush = extern struct {
     viewport_width: u32,
     viewport_height: u32,
     seed: u32,
-    reserved0: u32 = 0,
-    reserved1: u32 = 0,
+    view_mode: u32 = @intFromEnum(RenderView.cells),
+    channel_flags: u32 = channel_motion | channel_disturbance | channel_pressure,
 };
 
 pub const TestResult = extern struct {
@@ -114,9 +151,17 @@ pub const TestResult = extern struct {
     active_count: u32 = 0,
     cell_hash: u32 = 0,
     motion_hash: u32 = 0,
+    disturbance_hash: u32 = 0,
+    disturbed_cells: u32 = 0,
+    pressure_hash: u32 = 0,
+    pressurized_cells: u32 = 0,
+    steam_count: u32 = 0,
+    cloud_count: u32 = 0,
 };
 
 pub const channel_motion: u32 = 1 << 0;
+pub const channel_disturbance: u32 = 1 << 1;
+pub const channel_pressure: u32 = 1 << 2;
 
 pub fn alignUp(value: u64, alignment: u64) u64 {
     std.debug.assert(alignment != 0 and std.math.isPowerOfTwo(alignment));
@@ -135,21 +180,39 @@ pub fn motionBytes(width: u32, height: u32) u64 {
     return @as(u64, padded(width)) * padded(height) * @sizeOf(Motion);
 }
 
+pub fn disturbanceBytes(width: u32, height: u32) u64 {
+    return @as(u64, padded(width)) * padded(height) * @sizeOf(Disturbance);
+}
+
+pub fn pressureBytes(width: u32, height: u32) u64 {
+    return @as(u64, padded(width)) * padded(height) * @sizeOf(Pressure);
+}
+
 test "GPU ABI is stable" {
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(Cell));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SimPush));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(RenderPush));
-    try std.testing.expectEqual(@as(usize, 32), @sizeOf(TestResult));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(TestResult));
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(Motion));
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(Disturbance));
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(Pressure));
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(MovementProposal));
     try std.testing.expectEqual(@as(u32, 1088), padded(1080));
     try std.testing.expect(coreBytes(1920, 1080) < 32 * 1024 * 1024);
     try std.testing.expectEqual(@as(u64, 1920 * 1088 * 4), motionBytes(1920, 1080));
+    try std.testing.expectEqual(@as(u64, 1920 * 1088 * 4), disturbanceBytes(1920, 1080));
+    try std.testing.expectEqual(@as(u64, 1920 * 1088 * 4), pressureBytes(1920, 1080));
 }
 
 test "cell packing" {
     const cell = Cell{ .material = .water, .variant = 0x5a, .flags = 0xa5 };
     try std.testing.expectEqual(@as(u32, 0x00a55a02), cell.bits());
+}
+
+test "atmosphere material IDs and packed state are stable" {
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(Material.steam));
+    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(Material.cloud));
+    try std.testing.expectEqual(@as(u32, 0x00c85a05), (Cell.makeWithState(.cloud, 0x5a, 200)).bits());
 }
 
 test "alignment" {
@@ -166,4 +229,30 @@ test "motion and movement proposal packing" {
         .rejected_motion = 0x12,
     };
     try std.testing.expectEqual(@as(u32, 0x0000_4a6c), proposal.bits());
+}
+
+test "intent and motion direction encodings are stable" {
+    try std.testing.expectEqual(@as(u32, 6), @intFromEnum(Intent.up));
+    try std.testing.expectEqual(@as(u3, 6), @intFromEnum(MotionDirection.up));
+}
+
+test "render-view encodings are stable" {
+    try std.testing.expectEqual(@as(u32, 3), @intFromEnum(RenderView.pressure));
+    const push = RenderPush{
+        .width = 0,
+        .height = 0,
+        .padded_width = 0,
+        .viewport_width = 0,
+        .viewport_height = 0,
+        .seed = 0,
+    };
+    try std.testing.expectEqual(channel_motion | channel_disturbance | channel_pressure, push.channel_flags);
+}
+
+test "disturbance packing" {
+    try std.testing.expectEqual(@as(u32, 15), (Disturbance{ .energy = 15 }).bits());
+}
+
+test "pressure packing" {
+    try std.testing.expectEqual(@as(u32, 255), (Pressure{ .amount = 255 }).bits());
 }

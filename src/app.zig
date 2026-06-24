@@ -40,6 +40,10 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.Options) !void {
         simulation.padded_width,
         options.seed,
         simulation.cellBuffer(),
+        simulation.motionBuffer(),
+        simulation.disturbanceBuffer(),
+        simulation.pressureBuffer(),
+        simulation.channelFlags(),
         window.client_width,
         window.client_height,
         options.uncapped,
@@ -67,6 +71,7 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.Options) !void {
             uncapped = !uncapped;
             try renderer.setUncappedPresentation(uncapped, window.client_width, window.client_height);
         }
+        if (window.consumeKey(.view)) renderer.cycleView();
         if (window.consumeKey(.one)) selected = .sand;
         if (window.consumeKey(.two)) selected = .water;
         if (window.consumeKey(.three)) selected = .stone;
@@ -123,7 +128,7 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.Options) !void {
             var title_storage: [256]u8 = undefined;
             const title = std.fmt.bufPrintZ(
                 &title_storage,
-                "ZigSand | {d} FPS | {d} TPS{s} | {d}/{d} chunks | GPU I {d:.2} R {d:.2} C {d:.2} Draw {d:.2} ms | brush {d}{s}",
+                "ZigSand | {d} FPS | {d} TPS{s} | {d}/{d} chunks | GPU I {d:.2} R {d:.2} P {d:.2} D {d:.2} C {d:.2} Draw {d:.2} ms | view {s} | brush {d}{s}",
                 .{
                     frames,
                     ticks,
@@ -132,8 +137,11 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.Options) !void {
                     simulation.chunk_count,
                     simulation.last_timings.intent_ms,
                     simulation.last_timings.resolve_ms,
+                    simulation.last_timings.pressure_ms,
+                    simulation.last_timings.disturbance_ms,
                     simulation.last_timings.commit_ms,
                     renderer.last_render_ms,
+                    renderer.viewName(),
                     brush_radius,
                     if (paused) " | PAUSED" else "",
                 },
@@ -176,13 +184,28 @@ fn runGpuTests(allocator: std.mem.Allocator, options: cli.Options) !void {
             std.log.err("GPU test case {d} failed: mask=0x{x}", .{ test_case, result.failures });
         }
     }
+    for ([_]u32{ 20, 21, 22 }) |test_case| {
+        try simulation.resetScenario(test_case);
+        _ = try simulation.tick(null);
+        const result = try simulation.validate(test_case);
+        if (result.failures != 0) {
+            failures |= result.failures;
+            std.log.err("GPU atmosphere case {d} failed: mask=0x{x}", .{ test_case, result.failures });
+        }
+    }
 
-    // Only compact validation records cross back to the host; both canonical
-    // GPU channels are reset and replayed independently for every run.
+    // Only compact validation records cross back to the host; canonical GPU
+    // layers are reset and replayed independently for every run.
     const water_determinism = try runDeterminismCheck(&simulation, "Water basin", 15, 32, 100);
     failures |= water_determinism.failures;
     const sand_determinism = try runDeterminismCheck(&simulation, "Sand avalanche", 16, 10, 100);
     failures |= sand_determinism.failures;
+    const disturbance_determinism = try runDeterminismCheck(&simulation, "Water disturbance", 17, 8, 100);
+    failures |= disturbance_determinism.failures;
+    const pressure_determinism = try runDeterminismCheck(&simulation, "Water pressure", 18, 12, 100);
+    failures |= pressure_determinism.failures;
+    const atmosphere_determinism = try runDeterminismCheck(&simulation, "Atmospheric cycle", 23, 32, 100);
+    failures |= atmosphere_determinism.failures;
 
     // Once a blank world sleeps, repeated canonical/scratch ticks must neither
     // wake chunks nor mutate state.
@@ -222,34 +245,74 @@ fn runGpuTests(allocator: std.mem.Allocator, options: cli.Options) !void {
     if (odd.failures != 0) std.log.err("padded-boundary check failed: mask=0x{x}", .{odd.failures});
     failures |= odd.failures;
 
-    // The optional path binds only a one-word dummy buffer and must preserve
-    // the original cell-only behavior without touching MotionChannel.
+    // Exercise the optional-channel ownership branches independently.
+    var pressure_only_simulation = try gpu.Simulation.init(&context, .{
+        .width = 32,
+        .height = 32,
+        .seed = options.seed,
+        .enable_disturbance = false,
+    });
+    defer pressure_only_simulation.deinit();
+    try pressure_only_simulation.resetScenario(18);
+    for (0..12) |_| _ = try pressure_only_simulation.tick(null);
+    const pressure_only = try pressure_only_simulation.validate(18);
+    if (pressure_only.failures != 0 or pressure_only.pressure_hash == 0 or pressure_only.pressurized_cells < 100) {
+        std.log.err("pressure-only channel check failed: mask=0x{x} pressure=0x{x} cells={d}", .{ pressure_only.failures, pressure_only.pressure_hash, pressure_only.pressurized_cells });
+        failures |= 262144;
+    }
+
+    var disturbance_only_simulation = try gpu.Simulation.init(&context, .{
+        .width = 32,
+        .height = 32,
+        .seed = options.seed,
+        .enable_pressure = false,
+    });
+    defer disturbance_only_simulation.deinit();
+    try disturbance_only_simulation.resetScenario(17);
+    for (0..8) |_| _ = try disturbance_only_simulation.tick(null);
+    const disturbance_only = try disturbance_only_simulation.validate(17);
+    if (disturbance_only.failures != 0 or disturbance_only.disturbance_hash == 0 or disturbance_only.disturbed_cells <= 2) {
+        std.log.err("disturbance-only channel check failed: mask=0x{x} disturbance=0x{x} cells={d}", .{ disturbance_only.failures, disturbance_only.disturbance_hash, disturbance_only.disturbed_cells });
+        failures |= 16384;
+    }
+
+    // Optional paths bind one-word dummy buffers and preserve cell-only state.
     var no_motion_simulation = try gpu.Simulation.init(&context, .{
         .width = 32,
         .height = 32,
         .seed = options.seed,
         .enable_motion = false,
+        .enable_disturbance = false,
+        .enable_pressure = false,
     });
     defer no_motion_simulation.deinit();
     try no_motion_simulation.resetScenario(4);
     _ = try no_motion_simulation.tick(null);
     const no_motion = try no_motion_simulation.validate(4);
-    if (no_motion.failures != 0 or no_motion.motion_hash != 0 or no_motion.state_hash != no_motion.cell_hash) {
+    if (no_motion.failures != 0 or no_motion.motion_hash != 0 or no_motion.disturbance_hash != 0 or no_motion.pressure_hash != 0 or no_motion.state_hash != no_motion.cell_hash) {
         std.log.err(
-            "disabled MotionChannel check failed: mask=0x{x} state=0x{x} cells=0x{x} motion=0x{x}",
-            .{ no_motion.failures, no_motion.state_hash, no_motion.cell_hash, no_motion.motion_hash },
+            "disabled layered-channel check failed: mask=0x{x} state=0x{x} cells=0x{x} motion=0x{x} disturbance=0x{x} pressure=0x{x}",
+            .{ no_motion.failures, no_motion.state_hash, no_motion.cell_hash, no_motion.motion_hash, no_motion.disturbance_hash, no_motion.pressure_hash },
         );
         failures |= 16384;
     }
 
     if (failures != 0) return error.GpuTestsFailed;
     std.log.info(
-        "16 GPU checks passed; Water state=0x{x} motion=0x{x}; Sand state=0x{x} motion=0x{x}",
+        "24 GPU checks passed; Water state=0x{x} motion=0x{x}; Sand state=0x{x} motion=0x{x}; Disturbance state=0x{x} layer=0x{x}; Pressure state=0x{x} layer=0x{x}; Atmosphere state=0x{x} W/S/C={d}/{d}/{d}",
         .{
             water_determinism.baseline.state_hash,
             water_determinism.baseline.motion_hash,
             sand_determinism.baseline.state_hash,
             sand_determinism.baseline.motion_hash,
+            disturbance_determinism.baseline.state_hash,
+            disturbance_determinism.baseline.disturbance_hash,
+            pressure_determinism.baseline.state_hash,
+            pressure_determinism.baseline.pressure_hash,
+            atmosphere_determinism.baseline.state_hash,
+            atmosphere_determinism.baseline.water_count,
+            atmosphere_determinism.baseline.steam_count,
+            atmosphere_determinism.baseline.cloud_count,
         },
     );
 }
@@ -277,7 +340,7 @@ fn runDeterminismCheck(simulation: *gpu.Simulation, label: []const u8, scenario:
             if (!mismatch_reported) {
                 mismatch_reported = true;
                 std.log.err(
-                    "{s} determinism mismatch on run {d}: state 0x{x}/0x{x}, cells 0x{x}/0x{x}, motion 0x{x}/0x{x}, counts S {d}/{d} W {d}/{d} Stone {d}/{d}, active {d}/{d}",
+                    "{s} determinism mismatch on run {d}: state 0x{x}/0x{x}, cells 0x{x}/0x{x}, motion 0x{x}/0x{x}, disturbance 0x{x}/0x{x} ({d}/{d} cells), pressure 0x{x}/0x{x} ({d}/{d} cells), counts Sand {d}/{d} Water {d}/{d} Steam {d}/{d} Cloud {d}/{d} Stone {d}/{d}, active {d}/{d}",
                     .{
                         label,
                         run_index + 1,
@@ -287,10 +350,22 @@ fn runDeterminismCheck(simulation: *gpu.Simulation, label: []const u8, scenario:
                         result.cell_hash,
                         baseline.motion_hash,
                         result.motion_hash,
+                        baseline.disturbance_hash,
+                        result.disturbance_hash,
+                        baseline.disturbed_cells,
+                        result.disturbed_cells,
+                        baseline.pressure_hash,
+                        result.pressure_hash,
+                        baseline.pressurized_cells,
+                        result.pressurized_cells,
                         baseline.sand_count,
                         result.sand_count,
                         baseline.water_count,
                         result.water_count,
+                        baseline.steam_count,
+                        result.steam_count,
+                        baseline.cloud_count,
+                        result.cloud_count,
                         baseline.stone_count,
                         result.stone_count,
                         baseline.active_count,
@@ -307,8 +382,14 @@ fn sameDeterministicState(a: abi.TestResult, b: abi.TestResult) bool {
     return a.state_hash == b.state_hash and
         a.cell_hash == b.cell_hash and
         a.motion_hash == b.motion_hash and
+        a.disturbance_hash == b.disturbance_hash and
+        a.disturbed_cells == b.disturbed_cells and
+        a.pressure_hash == b.pressure_hash and
+        a.pressurized_cells == b.pressurized_cells and
         a.sand_count == b.sand_count and
         a.water_count == b.water_count and
+        a.steam_count == b.steam_count and
+        a.cloud_count == b.cloud_count and
         a.stone_count == b.stone_count and
         a.active_count == b.active_count;
 }

@@ -9,7 +9,9 @@ const activity_spv align(@alignOf(u32)) = @embedFile("activity_spv").*;
 const paint_spv align(@alignOf(u32)) = @embedFile("paint_spv").*;
 const intent_spv align(@alignOf(u32)) = @embedFile("intent_spv").*;
 const resolve_spv align(@alignOf(u32)) = @embedFile("resolve_spv").*;
+const pressure_spv align(@alignOf(u32)) = @embedFile("pressure_spv").*;
 const commit_spv align(@alignOf(u32)) = @embedFile("commit_spv").*;
+const disturbance_spv align(@alignOf(u32)) = @embedFile("disturbance_spv").*;
 const validate_spv align(@alignOf(u32)) = @embedFile("validate_spv").*;
 
 pub const Config = struct {
@@ -17,12 +19,16 @@ pub const Config = struct {
     height: u32,
     seed: u32,
     enable_motion: bool = true,
+    enable_disturbance: bool = true,
+    enable_pressure: bool = true,
 };
 pub const Brush = struct { x: u32, y: u32, radius: u32, material: abi.Material };
 pub const Timings = struct {
     intent_ms: f64 = 0,
     resolve_ms: f64 = 0,
     commit_ms: f64 = 0,
+    pressure_ms: f64 = 0,
+    disturbance_ms: f64 = 0,
     total_ms: f64 = 0,
     active_chunks: u32 = 0,
 };
@@ -88,7 +94,9 @@ const Pipelines = struct {
     paint: vk.Pipeline,
     intent: vk.Pipeline,
     resolve: vk.Pipeline,
+    pressure: vk.Pipeline,
     commit: vk.Pipeline,
+    disturbance: vk.Pipeline,
     validate: vk.Pipeline,
 
     fn deinit(self: Pipelines, ctx: *Context) void {
@@ -134,6 +142,8 @@ pub const Simulation = struct {
     intents: Buffer,
     material_specs: Buffer,
     motion: Buffer,
+    disturbance: Buffer,
+    pressure: Buffer,
     activity: [2]Activity,
     results: Buffer,
     descriptor_layout: vk.DescriptorSetLayout,
@@ -149,6 +159,7 @@ pub const Simulation = struct {
     tick_slot: usize = 0,
     parity: u1 = 0,
     tick_index: u32 = 0,
+    scenario_id: u32 = 0,
     last_timings: Timings = .{},
 
     pub fn init(ctx: *Context, config: Config) !Simulation {
@@ -186,6 +197,14 @@ pub const Simulation = struct {
             .storage_buffer_bit = true,
         }, .{ .device_local_bit = true }, false);
         errdefer self.motion.deinit(ctx);
+        self.disturbance = try Buffer.init(ctx, if (config.enable_disturbance) cell_bytes else @sizeOf(u32), .{
+            .storage_buffer_bit = true,
+        }, .{ .device_local_bit = true }, false);
+        errdefer self.disturbance.deinit(ctx);
+        self.pressure = try Buffer.init(ctx, if (config.enable_pressure) cell_bytes else @sizeOf(u32), .{
+            .storage_buffer_bit = true,
+        }, .{ .device_local_bit = true }, false);
+        errdefer self.pressure.deinit(ctx);
         self.activity[0] = try Activity.init(ctx, self.chunk_count);
         errdefer self.activity[0].deinit(ctx);
         self.activity[1] = try Activity.init(ctx, self.chunk_count);
@@ -209,7 +228,7 @@ pub const Simulation = struct {
         self.descriptor_pool = try ctx.device.createDescriptorPool(&.{
             .max_sets = 2,
             .pool_size_count = 1,
-            .p_pool_sizes = &.{.{ .type = .storage_buffer, .descriptor_count = 28 }},
+            .p_pool_sizes = &.{.{ .type = .storage_buffer, .descriptor_count = 32 }},
         }, null);
         errdefer ctx.device.destroyDescriptorPool(self.descriptor_pool, null);
         const layouts = [_]vk.DescriptorSetLayout{ self.descriptor_layout, self.descriptor_layout };
@@ -227,7 +246,9 @@ pub const Simulation = struct {
             .paint = try createPipeline(ctx, self.pipeline_layout, &paint_spv, "PaintMain"),
             .intent = try createPipeline(ctx, self.pipeline_layout, &intent_spv, "IntentMain"),
             .resolve = try createPipeline(ctx, self.pipeline_layout, &resolve_spv, "ResolveMain"),
+            .pressure = try createPipeline(ctx, self.pipeline_layout, &pressure_spv, "PressureMain"),
             .commit = try createPipeline(ctx, self.pipeline_layout, &commit_spv, "CommitMain"),
+            .disturbance = try createPipeline(ctx, self.pipeline_layout, &disturbance_spv, "DisturbanceMain"),
             .validate = try createPipeline(ctx, self.pipeline_layout, &validate_spv, "ValidateMain"),
         };
         errdefer self.pipelines.deinit(ctx);
@@ -255,6 +276,7 @@ pub const Simulation = struct {
         self.tick_slot = 0;
         self.parity = 0;
         self.tick_index = 0;
+        self.scenario_id = 0;
         self.last_timings = .{};
         try self.uploadMaterialSpecs(registry.gpuSlice());
         try self.resetScenario(0);
@@ -273,6 +295,8 @@ pub const Simulation = struct {
         self.results.deinit(self.ctx);
         self.activity[1].deinit(self.ctx);
         self.activity[0].deinit(self.ctx);
+        self.pressure.deinit(self.ctx);
+        self.disturbance.deinit(self.ctx);
         self.motion.deinit(self.ctx);
         self.material_specs.deinit(self.ctx);
         self.intents.deinit(self.ctx);
@@ -282,6 +306,7 @@ pub const Simulation = struct {
 
     pub fn resetScenario(self: *Simulation, test_case: u32) !void {
         try self.waitTicks();
+        self.scenario_id = test_case;
         try self.begin();
         const push = self.makePush(test_case, null);
         self.bind(self.pipelines.init, 0, &push);
@@ -307,8 +332,9 @@ pub const Simulation = struct {
 
     fn tickInternal(self: *Simulation, brush: ?Brush, force_all_active: bool) !Timings {
         // The command order is the simulation contract: metadata clear/paint,
-        // intent, destination-centric resolve, active-only commit, then list-role
-        // swap. Barriers make that order explicit on every Vulkan 1.3 driver.
+        // intent, destination-centric movement resolve, layered gathers,
+        // active-only commit, then list-role swap. Barriers make that order
+        // explicit on every Vulkan 1.3 driver.
         const slot = &self.tick_slots[self.tick_slot];
         _ = try self.ctx.device.waitForFences(&.{slot.fence}, .true, std.math.maxInt(u64));
         if (slot.pending) self.collectTimings(slot);
@@ -326,7 +352,7 @@ pub const Simulation = struct {
         self.ctx.device.cmdFillBuffer(self.command_buffer, next.args.handle, 0, 4, 0);
         self.transferToComputeBarrier();
 
-        const push = self.makePush(0, brush);
+        const push = self.makePush(self.scenario_id, brush);
         if (brush) |value| {
             self.bind(self.pipelines.paint, set_index, &push);
             const diameter = value.radius * 2 + 1;
@@ -342,9 +368,26 @@ pub const Simulation = struct {
         self.ctx.device.cmdDispatchIndirect(self.command_buffer, self.activity[set_index].args.handle, 0);
         self.ctx.device.cmdWriteTimestamp2(self.command_buffer, .{ .compute_shader_bit = true }, slot.query_pool, 2);
         self.computeBarrier();
+        if (self.config.enable_pressure) {
+            // Movement proposals are dead after Resolve. Pressure gathers from
+            // the resolved topology into the same proposal grid.
+            self.bind(self.pipelines.pressure, set_index, &push);
+            self.ctx.device.cmdDispatchIndirect(self.command_buffer, self.activity[set_index].args.handle, 0);
+        }
+        self.ctx.device.cmdWriteTimestamp2(self.command_buffer, .{ .compute_shader_bit = true }, slot.query_pool, 3);
+        self.computeBarrier();
+        if (self.config.enable_disturbance) {
+            // Disturbance commits destination-owned Pressure before reusing
+            // Intents for its own proposals. No pressure scratch grid or
+            // separate pressure commit dispatch is required.
+            self.bind(self.pipelines.disturbance, set_index, &push);
+            self.ctx.device.cmdDispatchIndirect(self.command_buffer, self.activity[set_index].args.handle, 0);
+        }
+        self.ctx.device.cmdWriteTimestamp2(self.command_buffer, .{ .compute_shader_bit = true }, slot.query_pool, 4);
+        self.computeBarrier();
         self.bind(self.pipelines.commit, set_index, &push);
         self.ctx.device.cmdDispatchIndirect(self.command_buffer, self.activity[set_index].args.handle, 0);
-        self.ctx.device.cmdWriteTimestamp2(self.command_buffer, .{ .compute_shader_bit = true }, slot.query_pool, 3);
+        self.ctx.device.cmdWriteTimestamp2(self.command_buffer, .{ .compute_shader_bit = true }, slot.query_pool, 5);
         self.computeBarrier();
         if (force_all_active) {
             self.bind(self.pipelines.activity, next_index, &push);
@@ -352,7 +395,7 @@ pub const Simulation = struct {
             self.computeBarrier();
         }
         self.ctx.device.cmdCopyBuffer(self.command_buffer, next.meta.handle, slot.stats_readback.handle, &.{.{ .src_offset = 0, .dst_offset = 0, .size = 4 }});
-        self.ctx.device.cmdWriteTimestamp2(self.command_buffer, .{ .bottom_of_pipe_bit = true }, slot.query_pool, 4);
+        self.ctx.device.cmdWriteTimestamp2(self.command_buffer, .{ .bottom_of_pipe_bit = true }, slot.query_pool, 6);
         try self.ctx.device.endCommandBuffer(self.command_buffer);
         const command_info = vk.CommandBufferSubmitInfo{ .command_buffer = self.command_buffer, .device_mask = 0 };
         try self.ctx.device.queueSubmit2(self.ctx.queue.handle, &.{.{
@@ -403,6 +446,22 @@ pub const Simulation = struct {
 
     pub fn cellBuffer(self: *const Simulation) vk.Buffer {
         return self.cells.handle;
+    }
+
+    pub fn motionBuffer(self: *const Simulation) vk.Buffer {
+        return self.motion.handle;
+    }
+
+    pub fn disturbanceBuffer(self: *const Simulation) vk.Buffer {
+        return self.disturbance.handle;
+    }
+
+    pub fn pressureBuffer(self: *const Simulation) vk.Buffer {
+        return self.pressure.handle;
+    }
+
+    pub fn channelFlags(self: *const Simulation) u32 {
+        return channelFlagsFor(self.config);
     }
 
     fn begin(self: *Simulation) !void {
@@ -461,7 +520,7 @@ pub const Simulation = struct {
             .tick = self.tick_index,
             .seed = self.config.seed,
             .test_case = test_case,
-            .channel_flags = if (self.config.enable_motion) abi.channel_motion else 0,
+            .channel_flags = self.channelFlags(),
         };
         if (brush) |value| {
             push.brush_x = value.x;
@@ -479,10 +538,11 @@ pub const Simulation = struct {
             &self.activity[now_index].flags, &self.activity[now_index].list,   &self.activity[now_index].meta,
             &self.activity[now_index].args,  &self.activity[next_index].flags, &self.activity[next_index].list,
             &self.activity[next_index].meta, &self.activity[next_index].args,  &self.results,
-            &self.material_specs,            &self.motion,
+            &self.material_specs,            &self.motion,                     &self.disturbance,
+            &self.pressure,
         };
-        var infos: [14]vk.DescriptorBufferInfo = undefined;
-        var writes: [14]vk.WriteDescriptorSet = undefined;
+        var infos: [16]vk.DescriptorBufferInfo = undefined;
+        var writes: [16]vk.WriteDescriptorSet = undefined;
         for (buffers, 0..) |buffer, binding| {
             infos[binding] = .{ .buffer = buffer.handle, .offset = 0, .range = buffer.size };
             writes[binding] = .{
@@ -530,20 +590,22 @@ pub const Simulation = struct {
     }
 
     fn collectTimings(self: *Simulation, slot: *const TickSlot) void {
-        var values: [5]u64 = .{0} ** 5;
+        var values: [7]u64 = .{0} ** 7;
         const result = self.ctx.device.getQueryPoolResults(slot.query_pool, 0, values.len, @sizeOf(@TypeOf(values)), &values, @sizeOf(u64), .{ .@"64_bit" = true }) catch return;
         if (result != .success) return;
         const period = @as(f64, self.ctx.properties.limits.timestamp_period) / 1_000_000.0;
         self.last_timings.intent_ms = @as(f64, @floatFromInt(values[1] - values[0])) * period;
         self.last_timings.resolve_ms = @as(f64, @floatFromInt(values[2] - values[1])) * period;
-        self.last_timings.commit_ms = @as(f64, @floatFromInt(values[3] - values[2])) * period;
-        self.last_timings.total_ms = @as(f64, @floatFromInt(values[4] - values[0])) * period;
+        self.last_timings.pressure_ms = @as(f64, @floatFromInt(values[3] - values[2])) * period;
+        self.last_timings.disturbance_ms = @as(f64, @floatFromInt(values[4] - values[3])) * period;
+        self.last_timings.commit_ms = @as(f64, @floatFromInt(values[5] - values[4])) * period;
+        self.last_timings.total_ms = @as(f64, @floatFromInt(values[6] - values[0])) * period;
         self.last_timings.active_chunks = @as(*const u32, @ptrCast(@alignCast(slot.stats_readback.mapped.?))).*;
     }
 };
 
 fn createDescriptorLayout(ctx: *Context) !vk.DescriptorSetLayout {
-    var bindings: [14]vk.DescriptorSetLayoutBinding = undefined;
+    var bindings: [16]vk.DescriptorSetLayoutBinding = undefined;
     for (&bindings, 0..) |*binding, index| binding.* = .{
         .binding = @intCast(index),
         .descriptor_type = .storage_buffer,
@@ -569,4 +631,10 @@ fn createPipeline(ctx: *Context, layout: vk.PipelineLayout, code: []align(4) con
 
 fn divCeil(value: u32, divisor: u32) u32 {
     return (value + divisor - 1) / divisor;
+}
+
+fn channelFlagsFor(config: Config) u32 {
+    return (if (config.enable_motion) abi.channel_motion else 0) |
+        (if (config.enable_disturbance) abi.channel_disturbance else 0) |
+        (if (config.enable_pressure) abi.channel_pressure else 0);
 }

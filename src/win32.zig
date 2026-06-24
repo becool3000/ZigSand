@@ -15,6 +15,7 @@ pub const Key = enum(u8) {
     clear = 'C',
     reset = 'R',
     turbo = 'T',
+    view = 'V',
 };
 
 pub const Window = struct {
