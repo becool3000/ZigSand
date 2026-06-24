@@ -639,15 +639,20 @@ void IntentMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID, ui
         // Gas mobility is trait-selected. Friction becomes a deterministic
         // cadence control: Steam rises every tick while denser Cloud drifts
         // more slowly without requiring another per-cell channel.
-        uint period = 1u + FrictionOf(spec) / 4u;
+        uint period = material == MATERIAL_CLOUD ? 1u : 1u + FrictionOf(spec) / 4u;
         if ((Push.tick + index) % period == 0u) {
+            bool left = GasCanEnter(spec, MaterialOf(IntentTileCell(coord + int2(-1, 0), base)));
+            bool right = GasCanEnter(spec, MaterialOf(IntentTileCell(coord + int2(1, 0), base)));
+            uint preferred = (Mix(index ^ Push.tick ^ Push.seed ^ 0x165667b1u) & 1u) == 0u ? INTENT_LEFT : INTENT_RIGHT;
+            if (material == MATERIAL_CLOUD && (left || right)) {
+                if (left && right) intent = preferred;
+                else if (left) intent = INTENT_LEFT;
+                else intent = INTENT_RIGHT;
+            }
             uint above = MaterialOf(IntentTileCell(coord + int2(0, 1), base));
-            if (GasCanRiseThrough(spec, above)) {
+            if (intent == INTENT_STAY && GasCanRiseThrough(spec, above)) {
                 intent = INTENT_UP;
-            } else {
-                bool left = GasCanEnter(spec, MaterialOf(IntentTileCell(coord + int2(-1, 0), base)));
-                bool right = GasCanEnter(spec, MaterialOf(IntentTileCell(coord + int2(1, 0), base)));
-                uint preferred = (Mix(index ^ Push.tick ^ Push.seed ^ 0x165667b1u) & 1u) == 0u ? INTENT_LEFT : INTENT_RIGHT;
+            } else if (intent == INTENT_STAY) {
                 if (left && right) intent = preferred;
                 else if (left) intent = INTENT_LEFT;
                 else if (right) intent = INTENT_RIGHT;
@@ -859,6 +864,12 @@ uint ApplyAtmosphereTransition(uint cell, int2 coord, uint index) {
     return cell;
 }
 
+uint RainMotion(uint index) {
+    uint key = Mix(index ^ (Push.tick * 0x85ebca6bu) ^ Push.seed ^ 0x6ac690c5u);
+    uint side = (key & 1u) == 0u ? INTENT_LEFT : INTENT_RIGHT;
+    return MakeMotion(side, 6u);
+}
+
 [numthreads(16, 16, 1)]
 void CommitMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID) {
     uint chunkIndex = NowList[groupId.x];
@@ -881,8 +892,13 @@ void CommitMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID) {
         uint resolvedMaterial = MaterialOf(resolved);
         uint committedMaterial = MaterialOf(committed);
         if (committedMaterial != resolvedMaterial) {
-            WriteMotion(index, 0u);
-            WriteDisturbance(index, 0u);
+            if (resolvedMaterial == MATERIAL_CLOUD && committedMaterial == MATERIAL_WATER) {
+                WriteMotion(index, RainMotion(index));
+                WriteDisturbance(index, 15u);
+            } else {
+                WriteMotion(index, 0u);
+                WriteDisturbance(index, 0u);
+            }
             WritePressure(index, 0u);
         }
 
@@ -927,6 +943,15 @@ uint DisturbanceValue(int2 coord) {
 bool IsSurfaceWater(int2 coord, int2 base) {
     return MaterialOf(DisturbanceCell(coord, base)) == MATERIAL_WATER &&
         MaterialOf(DisturbanceCell(coord + int2(0, 1), base)) == MATERIAL_EMPTY;
+}
+
+bool HasFallingWaterAbove(int2 coord, int2 base) {
+    int2 above = coord + int2(0, 1);
+    if (MaterialOf(DisturbanceCell(above, base)) != MATERIAL_WATER) return false;
+    uint motion = ReadMotion(IndexOf(above));
+    uint direction = MotionDirectionOf(motion);
+    return MotionStrengthOf(motion) > 0u &&
+        (direction == INTENT_DOWN || direction == INTENT_DOWN_LEFT || direction == INTENT_DOWN_RIGHT);
 }
 
 uint PressureValue(int2 coord) {
@@ -1025,6 +1050,8 @@ void DisturbanceMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadI
             uint emission = min(15u, (motionStrength * response + 14u) / 15u);
             next = max(next, emission);
         }
+        if (HasFallingWaterAbove(coord, base))
+            next = 15u;
 
         if (IsSurfaceWater(coord + int2(-1, 0), base))
             next = max(next, DecayStrength(DisturbanceValue(coord + int2(-1, 0)), decay));
