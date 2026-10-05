@@ -448,6 +448,21 @@ uint ScenarioCell(int2 coord) {
             if (coord.x == 8 && coord.y >= 9 && coord.y <= 11)
                 return MakeCell(MATERIAL_SAND, (uint2)coord);
         }
+        if (Push.testCase == 26u) {
+            // Opposing local directions straddle x=16. The candidate at
+            // (16,12) has both diagonals open and must follow the stronger
+            // neighboring surface flow to the right.
+            if (all(coord == int2(16, 12)) || all(coord == int2(15, 13)))
+                return MakeCell(MATERIAL_SAND, (uint2)coord);
+            if (all(coord == int2(16, 11))) return MakeCell(MATERIAL_STONE, (uint2)coord);
+        }
+        if (Push.testCase == 27u) {
+            // A falling grain lands on a three-cell support and becomes fully
+            // blocked at the existing staircase slope.
+            if (coord.y == 11 && coord.x >= 14 && coord.x <= 16)
+                return MakeCell(MATERIAL_STONE, (uint2)coord);
+            if (all(coord == int2(15, 13))) return MakeCell(MATERIAL_SAND, (uint2)coord);
+        }
         return MakeCell(MATERIAL_EMPTY, (uint2)coord);
     }
 
@@ -463,7 +478,12 @@ uint ScenarioCell(int2 coord) {
 }
 
 uint ScenarioMotion(int2 coord, uint cell) {
-    if (!MotionEnabled() || MaterialOf(cell) != MATERIAL_WATER) return 0u;
+    if (!MotionEnabled()) return 0u;
+    if (Push.testCase == 26u && MaterialOf(cell) == MATERIAL_SAND) {
+        if (all(coord == int2(15, 13))) return MakeMotion(INTENT_RIGHT, SAND_START_STRENGTH);
+        if (all(coord == int2(16, 12))) return MakeMotion(INTENT_LEFT, SAND_START_STRENGTH);
+    }
+    if (MaterialOf(cell) != MATERIAL_WATER) return 0u;
     if (Push.testCase == 15u) {
         uint direction = coord.x <= 15 ? INTENT_RIGHT : INTENT_LEFT;
         return MakeMotion(direction, WATER_START_STRENGTH);
@@ -543,6 +563,53 @@ uint IntentTileCell(int2 coord, int2 base) {
     return SampleCell(coord);
 }
 
+bool IsAvalancheSurfaceSand(int2 coord, int2 base) {
+    if (!InBounds(coord) || MaterialOf(IntentTileCell(coord, base)) != MATERIAL_SAND) return false;
+    return MaterialOf(IntentTileCell(coord + int2(0, 1), base)) == MATERIAL_EMPTY;
+}
+
+uint SandAvalancheSide(int2 coord, int2 base, uint currentMotion, out uint influenceStrength) {
+    int leftVotes = 0;
+    int rightVotes = 0;
+    uint leftStrength = 0u;
+    uint rightStrength = 0u;
+    influenceStrength = 0u;
+
+    if (IsAvalancheSurfaceSand(coord, base)) {
+        // Read only previous-tick Motion. ResolveMain writes the next Motion
+        // after this proposal pass, so propagation is bounded to one stencil
+        // step per tick and independent of thread execution order.
+        [unroll] for (int y = -1; y <= 1; ++y) {
+            [unroll] for (int x = -1; x <= 1; ++x) {
+                if (x == 0 && y == 0) continue;
+                int2 neighbor = coord + int2(x, y);
+                if (!IsAvalancheSurfaceSand(neighbor, base)) continue;
+                uint motion = ReadMotion(IndexOf(neighbor));
+                if (!HasHorizontalMotion(motion)) continue;
+
+                uint side = HorizontalSideOf(motion);
+                uint strength = MotionStrengthOf(motion);
+                if (side == INTENT_LEFT) {
+                    leftVotes++;
+                    leftStrength = max(leftStrength, strength);
+                } else {
+                    rightVotes++;
+                    rightStrength = max(rightStrength, strength);
+                }
+            }
+        }
+    }
+
+    uint preferredSide;
+    if (leftVotes > rightVotes) preferredSide = INTENT_LEFT;
+    else if (rightVotes > leftVotes) preferredSide = INTENT_RIGHT;
+    else if (HasHorizontalMotion(currentMotion)) preferredSide = HorizontalSideOf(currentMotion);
+    else preferredSide = (Mix(IndexOf(coord) ^ Push.tick ^ Push.seed) & 1u) == 0u ? INTENT_LEFT : INTENT_RIGHT;
+
+    influenceStrength = preferredSide == INTENT_LEFT ? leftStrength : rightStrength;
+    return preferredSide;
+}
+
 [numthreads(16, 16, 1)]
 void IntentMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID, uint groupIndex : SV_GroupIndex) {
     uint chunkIndex = NowList[groupId.x];
@@ -568,13 +635,17 @@ void IntentMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID, ui
         uint currentStrength = MotionStrengthOf(currentMotion);
         uint decay = MotionDecayOf(spec);
         uint rejectionDecay = min(15u, decay + FrictionOf(spec));
-        uint preferredSide = HasHorizontalMotion(currentMotion) ? HorizontalSideOf(currentMotion) :
-            ((Mix(index ^ Push.tick ^ Push.seed) & 1u) == 0u ? INTENT_LEFT : INTENT_RIGHT);
+        uint influenceStrength = 0u;
+        uint preferredSide = material == MATERIAL_SAND ?
+            SandAvalancheSide(coord, base, currentMotion, influenceStrength) :
+            (HasHorizontalMotion(currentMotion) ? HorizontalSideOf(currentMotion) :
+                ((Mix(index ^ Push.tick ^ Push.seed) & 1u) == 0u ? INTENT_LEFT : INTENT_RIGHT));
         uint below = MaterialOf(IntentTileCell(coord + int2(0, -1), base));
         if (PowderCanEnter(spec, below)) {
             intent = INTENT_DOWN;
-            if (HasHorizontalMotion(currentMotion)) {
-                uint strength = DecayStrength(currentStrength, decay);
+            if (HasHorizontalMotion(currentMotion) || influenceStrength > 0u) {
+                uint strength = HasHorizontalMotion(currentMotion) ? DecayStrength(currentStrength, decay) :
+                    DecayStrength(influenceStrength, decay);
                 acceptedMotion = MakeMotion(DownwardMotionForSide(preferredSide), strength);
                 rejectedMotion = MakeMotion(OppositeSide(preferredSide), DecayStrength(strength, rejectionDecay));
             }
@@ -589,7 +660,8 @@ void IntentMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID, ui
                 uint chosenSide = intent == INTENT_DOWN_LEFT ? INTENT_LEFT : INTENT_RIGHT;
                 bool continuing = HasHorizontalMotion(currentMotion) && chosenSide == HorizontalSideOf(currentMotion);
                 uint strength = continuing ? DecayStrength(currentStrength, decay) :
-                    (currentStrength > 0u ? DecayStrength(currentStrength, rejectionDecay) : SAND_START_STRENGTH);
+                    (influenceStrength > 0u ? max(DecayStrength(currentStrength, rejectionDecay), DecayStrength(influenceStrength, decay)) :
+                        (currentStrength > 0u ? DecayStrength(currentStrength, rejectionDecay) : SAND_START_STRENGTH));
                 acceptedMotion = MakeMotion(intent, strength);
                 rejectedMotion = MakeMotion(OppositeSide(chosenSide), DecayStrength(strength, rejectionDecay));
             }
@@ -1174,6 +1246,16 @@ void ValidateMain(uint3 dispatchId : SV_DispatchThreadID) {
         MaterialOf(Cells[IndexOf(int2(8, 10))]) != MATERIAL_SAND ||
         MaterialOf(Cells[IndexOf(int2(8, 12))]) != MATERIAL_STEAM))
         result.failures |= 16777216u;
+    if (Push.testCase == 26u && (result.sandCount != 2u || result.motionHash == 0u ||
+        MaterialOf(Cells[IndexOf(int2(17, 11))]) != MATERIAL_SAND ||
+        MaterialOf(Cells[IndexOf(int2(15, 11))]) == MATERIAL_SAND))
+        result.failures |= 33554432u;
+    if (Push.testCase == 27u && (result.sandCount != 1u || result.motionHash != 0u || result.activeCount != 0u ||
+        MaterialOf(Cells[IndexOf(int2(15, 12))]) != MATERIAL_SAND))
+        result.failures |= 67108864u;
+    if (Push.testCase == 28u && (result.sandCount != 1u || result.activeCount == 0u ||
+        MaterialOf(Cells[IndexOf(int2(15, 11))]) != MATERIAL_SAND))
+        result.failures |= 134217728u;
 
     uint chunkCount = Push.chunksX * Push.chunksY;
     if (result.activeCount > chunkCount) result.failures |= 65536u;

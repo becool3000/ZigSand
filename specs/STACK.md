@@ -175,7 +175,7 @@ The simulation rotates three preallocated command-buffer, fence, timestamp-query
 Supported intents are Stay, Down, DownLeft, DownRight, Left, Right, and Up. Up is emitted only by gas mobility.
 
 - Powder mobility attempts Down first, then one valid diagonal; Sand is the first material using this trait-driven path.
-- Sand's short-lived Motion biases a valid diagonal after an avalanche begins. Accepted tendency lasts several moves, while rejection or forced redirection damps much faster than Water.
+- Sand's short-lived Motion biases a valid diagonal and spreads to exposed Sand in its bounded 3×3 surface neighborhood. Each grain reads only previous-tick Motion; deterministic vote ties preserve its own direction or use the coordinate/tick/seed hash. Accepted direction decays over several moves, while blocked flow clears and forced redirection damps faster than Water.
 - Water attempts Down first, then one valid horizontal side.
 - Water's nonzero Motion direction biases valid lateral choices; accepted motion decays by `motion_decay`, while rejection or redirection also applies `friction`.
 - Motion never permits an otherwise invalid cell move, and fully blocked motion decays to zero so chunks can sleep.
@@ -286,6 +286,8 @@ Headless GPU tests must read back only the compact result structure and must ver
 - The determinism state hash processes canonical Cells, MotionChannel, DisturbanceChannel, then PressureChannel in that fixed order, with separate component hashes retained in the compact result.
 - A falling-Water basin fixture retains material counts, exercises lateral Motion, and produces stable layered hashes over 100 resets.
 - A falling-Sand shelf fixture retains material counts, exercises diagonal Motion, and produces stable layered hashes over 100 resets.
+- A seeded cross-chunk Sand surface cue overrides an opposing local tendency only for a legal diagonal, retains Sand count, and produces stable Cells/Motion hashes over 100 resets.
+- A falling Sand grain settles on the current staircase slope until active chunks sleep; removing its support wakes the grain and resumes movement.
 - A shallow Water basin fixture emits and propagates surface Disturbance and produces stable Cells/Motion/Disturbance hashes over 100 resets.
 - A deep Water basin fixture builds nonzero integer head pressure while retaining material counts and produces stable four-layer hashes over 100 resets.
 - Supported Water deterministically converts to Steam without losing H2O mass.

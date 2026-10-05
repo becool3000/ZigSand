@@ -241,12 +241,36 @@ fn runGpuTests(allocator: std.mem.Allocator, options: cli.Options) !void {
         std.log.err("GPU Steam-under-Sand escape case failed: mask=0x{x}", .{steam_escape.failures});
     }
 
+    try simulation.resetScenario(26);
+    _ = try simulation.tick(null);
+    const sand_avalanche_spread = try simulation.validate(26);
+    if (sand_avalanche_spread.failures != 0) {
+        failures |= sand_avalanche_spread.failures;
+        std.log.err("GPU Sand avalanche spread case failed: mask=0x{x}", .{sand_avalanche_spread.failures});
+    }
+
+    try simulation.resetScenario(27);
+    for (0..3) |_| _ = try simulation.tick(null);
+    const settled_sand = try simulation.validate(27);
+    if (settled_sand.failures != 0) {
+        failures |= settled_sand.failures;
+        std.log.err("GPU Sand settle case failed: mask=0x{x}", .{settled_sand.failures});
+    }
+    _ = try simulation.tick(.{ .x = 15, .y = 11, .radius = 0, .material = .empty });
+    const disturbed_sand = try simulation.validate(28);
+    if (disturbed_sand.failures != 0) {
+        failures |= disturbed_sand.failures;
+        std.log.err("GPU Sand disturbance wake case failed: mask=0x{x}", .{disturbed_sand.failures});
+    }
+
     // Only compact validation records cross back to the host; canonical GPU
     // layers are reset and replayed independently for every run.
     const water_determinism = try runDeterminismCheck(&simulation, "Water basin", 15, 32, 100);
     failures |= water_determinism.failures;
     const sand_determinism = try runDeterminismCheck(&simulation, "Sand avalanche", 16, 10, 100);
     failures |= sand_determinism.failures;
+    const sand_spread_determinism = try runDeterminismCheck(&simulation, "Sand avalanche spread", 26, 1, 100);
+    failures |= sand_spread_determinism.failures;
     const disturbance_determinism = try runDeterminismCheck(&simulation, "Water disturbance", 17, 8, 100);
     failures |= disturbance_determinism.failures;
     const pressure_determinism = try runDeterminismCheck(&simulation, "Water pressure", 18, 12, 100);

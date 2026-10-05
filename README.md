@@ -74,7 +74,7 @@ This migration is intentionally incremental. Sand movement and liquid displaceme
 
 ### Layered channels
 
-- **MotionChannel:** actual integer movement tendency. Water retains lateral flow, while Sand retains only a brief diagonal avalanche tendency. Motion influences proposals but never bypasses occupancy or collision resolution.
+- **MotionChannel:** actual integer movement tendency. Water retains lateral flow, while exposed Sand shares a short-lived diagonal tendency with nearby surface grains to form deterministic avalanches. Motion influences proposals but never bypasses occupancy or collision resolution.
 - **PressureChannel:** unsigned integer body pressure from 0–255. Open Water surfaces release it, connected Water gathers it, and `pressure_response` builds deterministic head with depth. Pressure gradients may bias an already-valid lateral choice, but Pressure never moves Water upward.
 - **DisturbanceChannel:** short-lived unsigned surface energy from 0–15. Water Motion emits energy, connected surface Water gathers it laterally, and material-specific decay removes it. It can perturb Water's otherwise deterministic lateral preference, but it cannot make an invalid move valid. Sand and Stone absorb it.
 - **Friction:** an immutable material trait that increases rejected-motion damping. `motion_decay`, `pressure_response`, `disturbance_decay`, and `surface_response` are packed integer traits. Water currently uses zero friction, slow motion decay, slow disturbance decay, and nonzero surface response; Sand uses moderate friction and quickly absorbs disturbance.
